@@ -1,0 +1,120 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.venv/
+venv/
+
+# IDE / editor
+.vscode/
+.idea/
+.vs/
+*.swp
+
+# Windows shortcuts (local navigation aids)
+*.lnk
+
+# Claude / local settings
+.claude/
+
+# Internal-only working files (private notes, audits, raw measurements,
+# collaboration rules, policy spec set). Kept locally for the maintainer;
+# not published.
+CLAUDE.md
+Prompts/
+archive/
+AGENTS/
+
+# Datasets (large, not versioned)
+Insane BMS (2025-12-14)/
+test_dataset/
+labeling_out/
+labeling_out_full/
+labeling_out_dryrun/
+labeling_out_v3test*/
+
+# Source BMS packages (for sample generation / BMS.Compare listening / regression)
+# Listed by name in source_packages/README.md. All gitignored as a group.
+source_packages/
+
+# Generated pipeline outputs (per-package, scattered)
+token_analysis.json
+mix_generation_log.json
+placement_result.json
+placement_result.bms
+similarity_report.json
+normalized_events.json
+lnobj_silent.wav
+
+# Cache files (sit next to packages, scattered)
+*.cache
+*_cache.json
+
+# Model files (not versioned — trained separately)
+*.pt
+
+# Training artifacts (checkpoints, logs, caches)
+training/checkpoints/
+training/tb_logs/
+*.offsets.npy
+*.train_split.npy
+*.val_split.npy
+
+# Temp comparison files
+rb_result.json
+rb_marion.json
+ml_vs_rb_compare.json
+
+# ML bias ablation intermediate outputs (reproducible via tools/ml_ablation.py)
+ablation_*.json
+
+# Test fixture placement outputs (reproducible from pipeline)
+ml_marion_result.json
+ml_addiction_result.json
+rb_marion_v2.json
+rb_addiction_result.json
+
+# Listening-test BMS outputs and per-iteration JSON dumps
+addiction_*.bms
+addiction_*.json
+sample_*.bms
+sample_*.json
+_ml_lv*.json
+_rb_lv*.json
+placement_result_debug.json
+batch_lv5*.log
+
+# Throwaway scripts (ad-hoc batch runners)
+tools/_*.py
+
+# Internal analysis/survey tools (DP synthesis + scratch corpus measurement).
+# These drive private design decisions (see AGENTS/) and are not part of the
+# published product; the DP feature itself ships in placement_engine.py.
+tools/dp_axis_candidates.py
+tools/dp_corpus_survey.py
+tools/dp_source_character.py
+tools/dp_split_axis_survey.py
+tools/scratch_dependency_survey.py
+tools/scratch_likeness_calib.py
+tools/token_lane_consistency.py
+
+# Training run logs (verbose, regenerated each run)
+training/lane_retrain*.log
+
+# Batch logs
+tools/batch_mixgen_*.json
+tools/batch_mixgen_log_*.json
+
+# samples/ is internal-only (regression baselines + reroll demos kept by
+# the maintainer; not redistributed). The directory remains on the
+# maintainer's working tree but is excluded from git tracking and history.
+samples/
+
+# (samples/ is fully internal now — see the rule above; the per-wav rule
+# is no longer needed.)
+
+# One-shot pipeline scratchpad. Use out/ for ad-hoc runs so root stays clean.
+out/

@@ -1,0 +1,13 @@
+# BMS.Generator dependencies
+#
+# Core (RB pipeline — the default, recommended path):
+numpy
+scipy            # STFT acceleration; falls back to numpy FFT if absent, but recommended
+
+# Also required on PATH (not a pip package): ffmpeg
+#
+# ML mode (--ml) only. torch is NOT installed by default because the right
+# build depends on your CUDA / Python. Install it separately:
+#   Python 3.13 + GTX 1070 (this repo's setup) → CUDA cu118:
+#     pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu118
+# torch>=2.7
