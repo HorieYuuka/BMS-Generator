@@ -1,6 +1,6 @@
 # BMS.Generator
 
-[🇰🇷 한국어 README](README.ko.md)
+[🇰🇷 한국어 README](README.ko.md) · [🇯🇵 日本語 README](README.ja.md)
 
 A pipeline that automatically generates note placement for a BMS chart from the song's keysound pool.
 

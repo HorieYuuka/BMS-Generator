@@ -1,6 +1,6 @@
 # BMS.Generator
 
-[🇺🇸 English README](README.md)
+[🇺🇸 English README](README.md) · [🇯🇵 日本語 README](README.ja.md)
 
 BMS 차트의 키음 풀에서 노트 배치를 자동 생성하는 파이프라인.
 
