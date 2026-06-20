@@ -72,7 +72,8 @@ def main():
     ap.add_argument("--dp", action="store_true", default=False,
                     help="DP synthesis: produce a 14-key+2-scratch chart from the SP pool.")
     ap.add_argument("--dp-split", default="auto", choices=["auto", "timbre", "balance"],
-                    help="DP hand-split strategy (auto|timbre|balance). Default auto.")
+                    help="DP hand-split strategy: balance (default; auto→balance) "
+                         "or timbre (opt-in, stream songs). DR-DP13.")
     args = ap.parse_args()
 
     if bool(args.zip_path) == bool(args.folder):

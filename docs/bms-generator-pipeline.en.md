@@ -2,7 +2,7 @@
 
 **Subtitle**: Design and validation of a rule-based pipeline that rebuilds playable BMS charts from a source song's keysound pool, preserving the source's timing while remaining deterministic enough to support partial regeneration.
 
-**Version**: v12 (2026-05-25)
+**Version**: v12 (2026-05-25), with a draft double-play synthesis addendum (§8; 2026-06-14)
 
 > This is a technical report aimed at the BMS community. It assumes basic familiarity with the BMS chart format and rhythm-game charting, but explains every introduced term, policy, and constant in place.
 
@@ -12,12 +12,14 @@
 
 Most automatic-charting work frames the task as *difficulty synthesis* — generate a chart of a target hardness. BMS.Generator takes the opposite stance: it treats charting as *source-faithful reconstruction*. Given a source BMS file, the pipeline reuses the song's own keysound assets (the `#WAV` token pool) and re-derives a playable note layout at a requested intensity, **without re-timing** the source. The result sounds like the original song because it is built from the original sounds at the original onsets.
 
-The pipeline is rule-based (RB). A machine-learning path (token-selection + lane-assignment models) was trained and integrated behind an `--ml` flag, but a statistical evaluation found no measurable advantage over the rule-based path, so ML is operationally frozen (§8). The main contributions of the RB design are:
+The pipeline is rule-based (RB). A machine-learning path (token-selection + lane-assignment models) was trained and integrated behind an `--ml` flag, but a statistical evaluation found no measurable advantage over the rule-based path, so ML is operationally frozen (§9). The main contributions of the RB design are:
 
 1. A **band-based quota whitelist** with rare-token rescue — selects which pool tokens are playable using spectral-band-relative occurrence quotas rather than a single global hard filter, protecting melodic-but-sparse tokens.
 2. A **centroid-based relative lane assignment** — maps each note to a key lane by following the spectral-centroid trajectory of the music (brighter → move right, darker → move left) on a saturating curve, rather than assigning lanes randomly.
 3. A **source-aware scratch policy** — mirrors the source's own per-measure scratch density scaled by a level multiplier, instead of synthesizing scratches from an absolute density table.
 4. A **deterministic Resume API** — a per-measure RNG isolation (β-1) that makes any single measure (or measure range) reproducible in isolation, enabling an external editor to re-roll part of a chart without disturbing the rest.
+
+A draft extension (§8) reuses this machinery to synthesize **double-play (14-key)** charts from a single-play source, adding only a per-note *side* decision while preserving the same timing invariant and leaving SP output byte-identical.
 
 Validation is by construction rather than by corpus statistics: a 17-point conformance check suite (§6.1), a 6-song × {RB, ML} byte-identical regression baseline, and a 9-case Resume API smoke suite. The operational corpus is a 13-package source set spanning chord-dense, LN-heavy, scratch-heavy, and BPM-trick charts.
 
@@ -52,6 +54,8 @@ The "adequate" framing (v12 §21) is deliberate: the rule-based policy aims to *
 - **C2 — Centroid relative lane assignment.** Lanes are chosen by following the music's spectral-centroid motion on a per-song-calibrated saturating curve, with ε-greedy diversification, replacing v9's random lane pick. (§4.6)
 - **C3 — Source-aware scratch mirror.** In primary mode the output mirrors the source's per-measure scratch count × (level / 5), using the source's own minimum interval as the spacing floor, rather than a level-indexed absolute table. (§4.7)
 - **C4 — Deterministic Resume API.** A per-measure RNG (β-1: `Random(seed × 10⁶ + measure)`) removes the chart-wide sequential RNG coupling, so a measure range `[M, N]` can be regenerated from a serialized carry-over state, with optional N+1 boundary lookahead. This is the substrate an external editor uses to re-roll a single measure. (§5)
+
+- **C5 — Double-play synthesis (draft).** An `--dp` mode synthesizes a 14-key DP chart from an SP source under the same source-faithful stance: it splits each phrase across two hands by load (balance, the default, §8.2) and refines the result with a timing-invariant, jack-aware lane post-processor, never moving an onset and never altering SP output. (§8)
 
 A fifth, cross-cutting property — **determinism** — was hardened along the way: a class of `PYTHONHASHSEED`-dependent set/dict iteration non-determinism was found and removed (§5.5), and a 6-song regression baseline now guards byte-identical output.
 
@@ -88,13 +92,13 @@ mix_generation.py  →  placement_engine.py  →  bms_writer.py  →  similarity
 | **BMSWriter** | `placement_result.json` + source `.bms` | `placement_result.bms` | render placed notes + residual BGM back into a valid BMS file, preserving source timing lines |
 | **SimilarityCheck** | output `.bms` + package charts | `similarity_report.json` | report overlap against the package's existing charts (diagnostic, non-gating) |
 
-`run_pipeline.py` chains the four. The operational mode is **RB-only**; the `--ml` flag exists but is non-recommended (§8).
+`run_pipeline.py` chains the four. The operational mode is **RB-only**; the `--ml` flag exists but is non-recommended (§9).
 
 ### 2.3 Rule-based vs machine-learned — why RB is frozen-on
 
 Two models were trained: a `TokenSelectionModel` (which tokens to play) and a `LaneAssignmentModel` (which lane). On a v9 baseline the lane model reached ~50% top-1 accuracy versus 25% chance — a large apparent gain. But the gain was measured against the *random* lane baseline that v9 used. Once the rule-based path adopted centroid lane assignment (C2), the RB baseline itself captured much of the structure the model had learned, and a 2026-05-03 statistical evaluation found the ML models offered **no measurable advantage** over the RB path (v12 §19.5).
 
-A caveat is recorded honestly: in blind A/B listening the ML output was sometimes felt to be "more stable / more human," yet none of the RB-aligned metrics captured that impression. The verdict is therefore "no *measurable* advantage," not "no advantage" — a metric-blindness possibility (§8.2, §9.2). ML remains frozen behind a flag, not deleted.
+A caveat is recorded honestly: in blind A/B listening the ML output was sometimes felt to be "more stable / more human," yet none of the RB-aligned metrics captured that impression. The verdict is therefore "no *measurable* advantage," not "no advantage" — a metric-blindness possibility (§9.2, §10.2). ML remains frozen behind a flag, not deleted.
 
 ### 2.4 Framework stance: source dependence is acknowledged, not hidden
 
@@ -160,7 +164,7 @@ Before the per-mechanism policies, the code-level shape. PlacementEngine is a se
 for measure in [start .. end]:                 # default 0 .. measure_max
     rng = Random(seed × 10⁶ + measure)          # β-1 (§5.1)
     curr = reorder_within_idx(cands[measure])   # §4.3
-    if ml: curr = ml_token_rerank(curr)         # §8.4 (optional)
+    if ml: curr = ml_token_rerank(curr)         # §9.4 (optional)
     placed, hand_state, residual =
         _place_measure_constrained(curr, rng, hand_state, jack_state, …)
     token_usage += placed                       # under-used boost feeds next measure
@@ -263,7 +267,7 @@ RUSH-rest fires in fallback only; primary mode trusts source pacing and disables
 
 After placement, eligible Tap notes are promoted to Long Notes (LN). A Tap is an LN candidate when its token's sample duration ≥ `LN_MIN_DURATION_MS = 800` (a gate tuned to roughly the p75 of human LN duration). The drawn hold length is capped at `LN_MAX_HOLD_TICKS = 96` (a 2-beat visible cap, v11) so a long sample does not paint a screen-filling bar; the *audio* sample still plays in full — only the visible bar is capped. The hold is written using the chart's `#LNOBJ` token when one is declared.
 
-A known tension (§9.3): the 800 ms selection gate blocks ~75% of *naturally short* human LNs, so the pipeline under-produces LNs on LN-heavy songs. Lowering the gate uniformly would over-LN everything; a source-LN-signal infrastructure is the prerequisite for a per-song gate (future work).
+A known tension (§10.3): the 800 ms selection gate blocks ~75% of *naturally short* human LNs, so the pipeline under-produces LNs on LN-heavy songs. Lowering the gate uniformly would over-LN everything; a source-LN-signal infrastructure is the prerequisite for a per-song gate (future work).
 
 ### 4.9 Density rebalancing
 
@@ -387,11 +391,11 @@ An early diagnostic metric, `same_hand_streak`, showed an alarming fat tail on m
 
 ### 7.2 happiness — the BPM-naive LN cap
 
-`hapiness_lnext` is a human LN-heavy chart (757 LNs). The pipeline produced 0–6. Two causes compounded: the 800 ms selection gate (§4.8) blocks ~75% of naturally-short human LNs, and an earlier draw-length policy was BPM-naive — at 242 BPM a fixed tick hold painted a screen-filling bar. The draw-length cap `LN_MAX_HOLD_TICKS = 96` (visible-only) fixed the painting problem (v12 §22 DR-G1); the selection-gate problem remains open (§9.3) because lowering it uniformly would over-LN every chart.
+`hapiness_lnext` is a human LN-heavy chart (757 LNs). The pipeline produced 0–6. Two causes compounded: the 800 ms selection gate (§4.8) blocks ~75% of naturally-short human LNs, and an earlier draw-length policy was BPM-naive — at 242 BPM a fixed tick hold painted a screen-filling bar. The draw-length cap `LN_MAX_HOLD_TICKS = 96` (visible-only) fixed the painting problem (v12 §22 DR-G1); the selection-gate problem remains open (§10.3) because lowering it uniformly would over-LN every chart.
 
 ### 7.3 Single-measure reroll — the Resume API end-to-end
 
-`samples/reroll_demo_2026-05-18/` demonstrates the API: the signal chart's measure 58 is re-rolled in isolation (prefix `[0,57]` → `end_state` → resume `[58,58]` with N+1 lookahead), then spliced back. The output `.bms` differs from the base in **measure 58 only** — every other measure is byte-identical, confirming β-1's measure isolation. (The demo also exposed a limit: m58's last chord landed on the scratch lane, where the KEY-lane jack lookahead does not apply, so it is a wiring demonstration rather than a lane-swap demonstration — see §9.)
+`samples/reroll_demo_2026-05-18/` demonstrates the API: the signal chart's measure 58 is re-rolled in isolation (prefix `[0,57]` → `end_state` → resume `[58,58]` with N+1 lookahead), then spliced back. The output `.bms` differs from the base in **measure 58 only** — every other measure is byte-identical, confirming β-1's measure isolation. (The demo also exposed a limit: m58's last chord landed on the scratch lane, where the KEY-lane jack lookahead does not apply, so it is a wiring demonstration rather than a lane-swap demonstration — see §10.)
 
 ### 7.4 Source chord composition divergence
 
@@ -399,7 +403,109 @@ A cross-cutting finding (v12 §22 DR-K2): the pipeline systematically alters the
 
 ---
 
-## 8. Machine learning — trained, integrated, and frozen
+## 8. Double-play synthesis (`--dp`)
+
+A single-play (SP) chart uses 7 key lanes plus 1 scratch, played by one pair of hands. A **double-play (DP)** chart doubles this to 14 keys + 2 scratches split across two independent sides — **P1** (left hand, key lanes 1–7 + scratch) and **P2** (right hand). The community authors far fewer DP charts than SP, and many packages ship SP-only, so a player who wants a DP rendering of a song often has nothing to play. The `--dp` mode synthesizes one **from an SP source**.
+
+DP keeps the source-faithful stance of §2.4 exactly. The source's onsets are never moved; the SP pool universe, whitelist, intensity, and lane constraints are reused unchanged. The *only* new decision DP introduces is **side** — for each note, which hand plays it — followed by the existing within-side lane choice (§4.6). DP is therefore not a difficulty engine any more than the SP path is: it is the same projection of source sound events onto a playable lane space, now a 14+2 space.
+
+> **Status.** DP is implemented (RB-only, full-chart) and has passed listening evaluation on three source characters (stream, peak, chord). It is a **draft extension**, not yet a normative policy (tracked separately as a DRAFT addendum). The structural design below — split router, side-local placement, scratch policy, and the timing / SP-byte-identity guarantees — is stable. The pattern post-processing constants of §8.5 are still under listening-tuning and are flagged *provisional*: their values may move, but the layer's invariants (timing preservation, no-new-jacks, SP untouched) are fixed.
+
+### 8.1 What human DP charts actually do (corpus measurement)
+
+The design is anchored on a survey of **1,852 human DP charts** (`tools/dp_corpus_survey.py`, matched against a community DP corpus). Three findings shaped the policy:
+
+- **Both hands play together; they do not alternate.** 82.8% of non-empty beats are *BOTH*-hand beats, and single-hand runs longer than a few beats are essentially absent (32+ beat single-hand runs: 0.06%). An early design that gave one hand a measure off ("measure-block ALTERNATE") was discarded on this evidence — human DP is *division of simultaneous content*, not turn-taking. (DR-DP2)
+- **Same sound ⇒ same hand is the primary regularity.** A token's side is far more consistent (modal-side share **0.641**) than its specific lane (0.376). So DP carries a two-level affinity: a strong token→**side** memory and, within a side, the weaker token→lane memory reused from the SP engine.
+- **Adjacent / "impossible" scratch chords are vanishingly rare.** A scratch firing simultaneously with a same-side key in the 1–3 region (adjacent) occurs 1.5% of the time, in the 4–7 region (muri, "unreasonable") 1.2%. These rates split cleanly by curator culture (modern "stella"-style tables 0.1–1%, older "satellite" 4–5%), so a blanket prohibition is not an arbitrary tightening — it is the adoption of the modern convention (DR-DP3).
+
+All three held **invariant across difficulty families** (re-measured per family; side-chord, both-hands, and token→side shares barely move from ★ to ★★★), so the lv5 anchor needed no difficulty-specific correction.
+
+### 8.2 Side assignment — the split router
+
+The core decision is *which hand plays each note*. The default mode is **SPLIT**: within a phrase block, find a separating axis and assign the two resulting streams to the two hands.
+
+- **balance** (`--dp-split balance`, **default**, `auto`→balance) ignores timbre and splits for **load** — decomposing chords across hands (centroid alternation) and alternating sustained bursts to the lighter hand. **Whole-corpus listening established balance ≥ timbre (DR-DP13)**: on chord/peak songs timbre piles similar-sounding notes onto one hand and causes jack drops, and on stream songs the two are indistinguishable — so balance is the universal default.
+- **timbre** (`--dp-split timbre`, opt-in) splits on **low-frequency energy ratio** — bass / kick to one hand, the brighter remainder to the other. This axis is empirically real: across 13 SP sources × 1,216 measures, the best 2-way split's between-class variance ratio (η²) has a median of 0.913 and clears 0.5 on 99.8% of measures (DR-DP4). But it piles the "brighter remainder" onto one hand (R), causing a load lean, so it is kept as a stream-only opt-in. A *balance band* (`DP_MIN_SIDE_SHARE = 0.25`) and a per-measure 50/50 fallback keep either split from starving one hand.
+- **auto** goes to **balance** (DR-DP13). With balance as the universal default, the DR-DP7 auto-routing problem — choosing a strategy per song character — dissolves entirely (always balance, no character classification).
+
+Phrase **blocks** (the existing phase segmentation, §4.4, promoted here to its first operational use) are the granularity, and the token→side affinity glues hand assignment across block boundaries so the granularity need not be precise. A *mirror-on-repeat* heuristic toggles a phrase class's hands on re-appearance for variety.
+
+### 8.3 Side-local placement and DP-specific constraints
+
+Placement reuses the SP machine (§4.5) **per side**: each hand runs `_place_measure_constrained` with its own independent jack / hand / centroid / streak / affinity state, and the right hand's lanes are remapped P1_* → P2_*. The SP-specific hand-balance and same-hand-alternation rules are disabled (side assignment subsumes them); jack, collision, streak, and the scale-aware tick axis are unchanged because they are per-lane.
+
+DP adds two constraints:
+
+- **Per-side chord cap.** `DP_MAX_CHORD_SIZE_PER_SIDE` is a DP-specific lerp — 2 at lv5, rising to 5 at lv20 (five fingers; 4 is stable, 5 extreme). The combined two-hand cap is twice the per-side cap. (94% of human side-chords are ≤ 2, hence the lv5 = 2 anchor.)
+- **Scratch gate (hard).** When a scratch is placed on a side, **all seven same-side key lanes** at that timestamp (plus a chord-tier window) are removed from availability — no adjacent/muri distinction, a blanket block per DR-DP3. The key either moves to the other hand or residualizes. Scratch *side* is chosen by alternation with a load-avoidance correction (DR-DP5): prefer the side opposite the previous scratch, but yield to the other side if alternation would collide with the gate or overload one hand.
+
+### 8.4 Content rescue and the silence bug
+
+DP listening exposed two SP-whitelist interactions (cross-checked with Codex, DR-DP8):
+
+- **Played-content rescue.** The SP whitelist's FX-duration filter (a sample longer than 1000 ms is treated as background, §4.1) mis-classifies the long synth *leads* of genres like hardtek as FX and cuts up to ~79% of their key onsets. Removing the duration filter is *unsound* (it would flood the chart with those tokens' BGM occurrences). The adopted fix is **position-targeted**: an excluded token is restored as a DP candidate *only where the source played it on a key channel* (11–19), with an attack gate to exclude soft pads — the token's BGM occurrences are untouched, so there is no flood. Source-key play-rate on bumblebee rose 62% → 84%. The SP path is not touched.
+- **The silence bug.** The DP early-return path originally omitted the SP step that routes whitelist-*excluded* tokens to BGM, so those sounds were neither played nor auto-played — they were **completely silent** (33% of bumblebee's source-key content). This was the direct cause of an audible "melody dropout." Adding the residual construction to the DP path restored the audio; DP now preserves the full source audio the same way SP does.
+
+### 8.5 Pattern post-processing — timing-invariant lane refinement
+
+A post-placement layer (`_dp_postprocess`, after the per-measure loop and before the writer, gated by `if dp:`) refines the *lanes* of the placed notes — **never their timing**. It is DP-only: the SP path passes `lane_weights = None` and the layer's gates make SP output **byte-identical** to the pre-DP era. The layer's hard invariants, verified on every run by the `dp_pp_report` diagnostic, are: timing unchanged, content conserved (the `(measure, idx, token)` multiset is preserved — refused notes go to BGM, never vanish), and **no new jacks introduced**.
+
+The decisive lesson (DR-DP9) was that independent refinement passes fight each other and break the jack guarantee. A first version ran chord / stair / trill as separate passes that freely re-assigned lanes; it *introduced 113 jacks* (a fast passage mis-detected as a trill and forced onto two lanes faster than a hand can alternate — "a trill faster than a jack is not a trill"). The redesign runs all passes as **atomic commits on a shared per-side lane-tick timeline**: a pattern is applied only if every member clears the jack floor, otherwise the whole run **falls back** to its original jack-safe lanes. Post-processing may *re-verify and yield to* a placement-time hard constraint; it may never violate one.
+
+The passes, in order:
+
+- **chord** — order a chord's lanes by spectral centroid, and redistribute over-cap notes to a jack-safe free lane on the free hand;
+- **stair** — straighten a monotone run into an ascending/descending staircase;
+- **trill** — map an alternation onto two lanes ≥ 2 apart;
+- **forbidden shapes** — runs **last**, with a fixpoint loop, because stairs create the adjacent pairs it must break. It forbids the awkward one-hand simultaneous shapes `{2,3}` and `{5,6,7}` (mirrored on the right hand), using a *contains-match*, and includes **zure** (an IIDX term for near-simultaneous notes): notes within `DP_PP_ZURE_TICKS = 4` (a 48th-note window) are treated as an effective chord, since they play like one. A violating note is spread to a jack-safe free lane.
+
+Two distribution-level controls round out the layer, both informed by the lesson that *a post-hoc lever touches only some notes, so distribution targets must be driven at placement time*:
+
+- **density cap** — a combined two-hand per-measure ceiling (`DP_PP_COMBINED_MEASURE_CAP = 40`, *provisional*) sheds the weakest-attack excess to BGM. This is a *peak* limiter, not a global density reduction (measures below the cap are untouched); global density is the job of intensity (§8.6).
+- **rail lane-weights** — because one DP hand covers all seven keys, the ring-finger lanes (keys 2–3) are hard to press. A per-lane appearance weight (`{2: 0.9, 3: 0.95, 5: 0.9}`, mirrored; *provisional*) is injected at **placement time** as a keep-probability in the centroid lane selector — driving it from the post-processing density/stair passes proved too weak (noise only). SP is unaffected via the `lane_weights = None` guard.
+
+Finally, a **cross-measure scratch gate** (`_dp_pp_scratch_gate`, DR-DP11) enforces the §8.3 scratch prohibition on the *global* tick axis. The per-measure gate saw only within-measure indices, so adjacent/muri scratches leaked across bar boundaries (64 of 76 violations on signal were cross-measure); the global gate, run after the chord pass to also catch redistributed notes, drives muri scratches to zero. The lesson: a boundary-spanning constraint must be enforced on the global tick axis, not per measure.
+
+### 8.6 Intensity by character
+
+A DP-specific calibration lesson (DR-DP11): in DP, **intensity is a weak global-density lever**. Because the source onsets are laid down as-is and the per-side cap is binding, lv8 and lv12 produce nearly the same density; only lv5 meaningfully thins the median. What intensity *does* control strongly is the **per-side chord capacity** (`DP_MAX_CHORD_SIZE_PER_SIDE`). The guidance that follows:
+
+- **chord-character songs → high intensity**, to give both hands the simultaneous-press capacity the song's chords need;
+- **stream / peak / stair songs → conservative (low) intensity** — these are dense single-note textures that need no extra capacity, and a lower intensity preserves readability.
+
+(signal, a stream song, was finalized at lv5.)
+
+### 8.7 Source-aware scratch generation (DR-S1)
+
+The SP scratch policy of §4.7 had three modes (primary mirror / fallback synthesis / disabled), and DP long had **only the primary mirror** — which is why `--scratch level > 5` was a no-op. Two observations resolved it.
+
+First, **scratch is a charting (placement) decision, not an acoustic property**. The same `#WAV` is keyed in one chart and wheeled in another, so any attempt to classify a "scratch *token*" from audio features fails robustly (rank-AUC 0.47–0.62, chance level). But second, scratch **position is predictable**: across an SP corpus of ~600 charts (49.6k scratch onsets), scratches concentrate on strong beats (quarter rate-lift 2.19×, on-quarter rank-AUC 0.69 — above the audio ceiling), with a lower beat-phase entropy (0.314) than keys (0.532). DP behaves the same. **The timbre is the author's subjective call, but the position is rhythmic convention.**
+
+So scratch generation is solved as a **move** — not an invention. The generator picks scratch-*eligible* residual (BGM) onsets and moves them to the wheel:
+
+- **Eligibility** = 2a (the source's own wheel tokens, appearing on channel `16`) ∪ 2b (a functional gate: short duration, sufficient attack, recurring, key-origin — not background FX). A moved onset keeps *its own token* (no substitution); eligibility is just a loose filter that blocks dragging a melodic lead onto the wheel.
+- **Density** is anchored not to the source but to the **human DP corpus** (scratches per active measure p50 = 0.26 / p90 = 1.03; SP is 0.69 / 1.79 — DP is sparser because both hands are busy with keys). Level lerps between p50 and p90.
+- **Placement convention**: a single scratch hand per measure (existing scratch measures keep their hand, new ones alternate); the §8.3 anti-jump gate demotes same-hand keys adjacent to a new scratch to BGM.
+
+Because it only moves, the `(measure, idx, token)` multiset is preserved — the same guarantee as the content invariant of §8.5, **zero invention**. The DP primary supplement is therefore **on by default** (resolving the `level > 5` no-op; `level ≤ 5` is the mirror and stays byte-identical). SP position re-ranking and fallback synthesis are kept opt-in (SP default output unchanged; fallback, lacking a corpus sample, is e2e-verified only via a forced-fallback fixture).
+
+**An honest ceiling.** The position choice and density *target* are source-independent, but candidate *availability* and the density *ceiling* are source-bound (the necessity of zero invention). When eligible residual onsets are exhausted the generator plateaus (mightyA caps at ~62 — evidence of the source ceiling; lepontinia, supply-rich, goes further). This is not a defect but a direct consequence of the §2.4 stance: the maximum position-independence achievable without invention.
+
+### 8.8 Conformance and DP-specific limitations
+
+DP runs a 5-song smoke suite (`tools/_dp_smoke.py`): zero side-chords > 2, zero combined chords > 3, zero scratch-gate violations, zero collisions. Every run also emits `dp_pp_report` (timing-invariant flag, jack-before/after, pattern applied/fallback counts, per-lane distribution), and an A/B harness (`tools/dp_pp_report.py`) re-verifies the post-processing layer with it on and off. DP rejects resume / finalize / ML — it is full-chart, RB-only.
+
+Open items:
+
+- **The no-invention ceiling on placement appropriateness — the onset-invention frontier.** The move-based generation of §8.7 places scratches at strong-beat-aligned *eligible residual* positions. When those positions diverge from the song's groove (kick/snare) — because the groove slots are occupied by keys or scratch-ineligible tokens — a move alone cannot reach them. Reaching them needs **onset-invention** (placing one of the song's existing palette tokens at a *new* time, which is what human charters do). To gauge it we measured an onset-coalition backbone score — summing the evidence from *all* events at a tick (a refinement of single-dominant-token detection): the composite score clears the positional ceiling (per-chart AUC 0.69 → 0.77), but the *conditional* signal with position held fixed was thin (AUC 0.56 within on-quarter onsets), and injecting that thin signal into the existing move ranking left placement-quality metrics unchanged — the move candidates are already uniformly strong-beat-aligned, and most weakly-placed scratches are *source mirrors* we cannot move. Conclusion: the value of no-invention scratch is *reach*, not *better ranking*, and that reach (= onset-invention) is the *re-timing* the §2.4 source-fidelity stance holds out of scope by construction — so it is left as a deliberate frontier (future work under the token-set ⊆ source and chart-preservation invariants).
+- **Two of six characters are uncovered.** The split router handles stream / peak / chord; the **ln** (long-note vs tap hand-split) and **soft** characters are not yet addressed.
+- **Strategy auto-routing is unsolved** (DR-DP7); character must be chosen by the user.
+- **Normative promotion is pending** broader validation, an LN pass, and tighter rail-weight calibration (the spillover from rejected notes makes the current rail bias a "feel," not an exact ratio).
+
+---
+
+## 9. Machine learning — trained, integrated, and frozen
 
 The ML path is not a sketch. Both models were trained end-to-end from a labeled corpus, exported to TorchScript, and wired into the live inference path behind `--ml`. It is documented in full here because "we tried ML and it didn't win" is only useful to the community if the *how* — the data, the architecture, the training setup — is on the record.
 
@@ -408,7 +514,7 @@ The ML path is not a sketch. Both models were trained end-to-end from a labeled 
 | `TokenSelectionModel` | pct-based candidate ordering (§4.3) | ≈ 6.3K | masked BCE | wired (`--ml`), no measurable gain |
 | `LaneAssignmentModel` | centroid lane pick (§4.6) | ≈ 24.8K | masked CE | wired (`--ml`), no measurable gain |
 
-### 8.1 Data preparation — the labeling pipeline
+### 9.1 Data preparation — the labeling pipeline
 
 Training data is extracted from real human charts by `data_labeling.py`: for every eligible measure of every chart in a package, it emits a record pairing the *situation* (measure + pool + context features) with the *human decision* (which tokens were played, on which lanes).
 
@@ -419,7 +525,7 @@ Training data is extracted from real human charts by `data_labeling.py`: for eve
 
 The pipeline was run at full scale (~6,395 packages). A **v2 → v3 schema redesign** was forced mid-run: v2 accumulated all records in memory before writing, which OOM-crashed and filled ~471 GB of disk on the full corpus. v3 streams records to JSONL with a package-level pool table (lifting the 14-feature rows out of the per-record payload), and — per §5.5 — its token iteration was later sorted for training determinism.
 
-### 8.2 Model architecture
+### 9.2 Model architecture
 
 Both are deliberately small MLPs with a fixed inference interface; the tensor column orders are pinned by the model I/O contract so a retrain can never silently shift a feature.
 
@@ -428,7 +534,7 @@ Both are deliberately small MLPs with a fixed inference interface; the tensor co
 
 The small size is intentional (by design): the models are *re-rankers that assist RB*, not the dominant decision-maker, so a capacity ceiling guards against a model overpowering the rule constraints. `LayerNorm` is the first layer in both — input features span very different natural scales (`duration_ms` in the hundreds vs `attack_rms` in [0,1]) and per-sample normalization avoids maintaining running statistics at inference.
 
-### 8.3 Training setup
+### 9.3 Training setup
 
 - **Optimizer** — Adam, `lr = 1e-3`, `weight_decay = 1e-4`; `Dropout(0.3)` after each hidden ReLU. No BatchNorm (it interacts poorly with variable-`P` siamese batches and small batches).
 - **Schedule** — up to 20 epochs with early stopping (`patience = 3`), batch size 256.
@@ -437,37 +543,37 @@ The small size is intentional (by design): the models are *re-rankers that assis
 - **Export** — TorchScript `script` (not `trace`, `DR-4`, so control flow survives), loaded `map_location="cpu"` at inference (`DR-8`) — generation needs no GPU.
 - **Environment** — the operational trap worth recording: Python 3.13 + a GTX 1070 requires the CUDA **cu118** PyTorch build (cu121 ships no 3.13 wheel). The class-weighted lane retrain (`training/checkpoints`, `lane_cw2` TensorBoard run) was performed under this setup.
 
-### 8.4 Integration — soft re-ranker with rule-based fallback
+### 9.4 Integration — soft re-ranker with rule-based fallback
 
 Both models integrate as *soft re-rankers*: the RB policy owns every structural decision (which segment, how many notes, which constraints), and the model only reorders within the RB-permitted set. On any inference failure (exception, shape mismatch, lane model disabled, empty availability) the call falls back to the rule path — the token model to pct ordering, the lane model to the centroid / Fisher-Yates pick. By construction the model can improve ordering but can *never* violate a constraint. A fill-back ranking hook (density rebalance uses the token model to order pull-backs) was added later with separate diagnostics counters.
 
-### 8.5 The verdict, and the metric-blindness caveat
+### 9.5 The verdict, and the metric-blindness caveat
 
-On a v9 baseline the lane model's ~50% top-1 accuracy (vs 25% chance) looked decisive. But that baseline was *random* lane assignment. After the RB path adopted centroid lane assignment (§4.6), the RB baseline itself captured most of the learnable structure, and the 2026-05-03 statistical evaluation found **no measurable advantage** for either model over RB. A separate finding from that audit: the lane model had learned a K1/K3/K4 lane prior — it leaned on the most common lanes rather than the context, which is exactly what class weighting (§8.3) was introduced to counter.
+On a v9 baseline the lane model's ~50% top-1 accuracy (vs 25% chance) looked decisive. But that baseline was *random* lane assignment. After the RB path adopted centroid lane assignment (§4.6), the RB baseline itself captured most of the learnable structure, and the 2026-05-03 statistical evaluation found **no measurable advantage** for either model over RB. A separate finding from that audit: the lane model had learned a K1/K3/K4 lane prior — it leaned on the most common lanes rather than the context, which is exactly what class weighting (§9.3) was introduced to counter.
 
-The honest caveat: in blind A/B listening the ML output was repeatedly *felt* to be more stable / more human, yet no RB-aligned metric captured it. So the verdict is "no *measurable* advantage," with an explicit metric-blindness possibility — the listening impression is a fact; only its quantification is unsolved (§9.2). The class-weighted retrain improved the lane prior but did not move the verdict; its result was absorbed into the freeze decision.
+The honest caveat: in blind A/B listening the ML output was repeatedly *felt* to be more stable / more human, yet no RB-aligned metric captured it. So the verdict is "no *measurable* advantage," with an explicit metric-blindness possibility — the listening impression is a fact; only its quantification is unsolved (§10.2). The class-weighted retrain improved the lane prior but did not move the verdict; its result was absorbed into the freeze decision.
 
-### 8.6 Lesson — conceptual soundness does not guarantee empirical adoption
+### 9.6 Lesson — conceptual soundness does not guarantee empirical adoption
 
 Two ideas were conceptually clean — a token model that knows token preference, a lane model that learned human lane habits — and both lost to a cheaper rule once the rule got good enough. The honest reading (recorded by the user) is that the models never learned from *calibrated* charts — the training corpus is "whatever humans charted," not "charts judged good" — so an uncalibrated corpus cannot yield a calibrated model; the gap is in the training setup, not the model capacity. ML is frozen behind a flag rather than deleted, so the contract survives a future re-design, but adding more injection points (fill-back, scratch seed, LN candidate) is gated on measured benefit, not intuition. The same shape recurs in the character-framework's audio-FFT stair detection: *a sound idea is a hypothesis, and a hypothesis must survive an empirical audit before it earns a place in the pipeline.*
 
 ---
 
-## 9. Limitations and future work
+## 10. Limitations and future work
 
-### 9.1 Source dependence
+### 10.1 Source dependence
 
 The output is a projection of the source. A sparse or monotone source yields a sparse or monotone chart; the pipeline cannot invent rhythm because doing so would break the timing invariant (§2.4). This is a deliberate boundary, not a defect — but it means the pipeline is a *renderer*, not a *composer*.
 
-### 9.2 The listening-proxy gap
+### 10.2 The listening-proxy gap
 
-The strongest open problem: RB-aligned metrics do not capture the ML-vs-RB listening difference (§8.2). Until a metric correlates with the blind-A/B impression, any "ML is worse" claim is metric-bounded. The planned next step is a listening-decomposition protocol (short A/B segments + user "stable" annotations) to narrow the hypothesis before designing a new metric — the first metric attempt (same-hand fat-tail) already failed as a chord-collapse artifact (§7.1).
+The strongest open problem: RB-aligned metrics do not capture the ML-vs-RB listening difference (§9.2). Until a metric correlates with the blind-A/B impression, any "ML is worse" claim is metric-bounded. The planned next step is a listening-decomposition protocol (short A/B segments + user "stable" annotations) to narrow the hypothesis before designing a new metric — the first metric attempt (same-hand fat-tail) already failed as a chord-collapse artifact (§7.1).
 
-### 9.3 LN-style blindness
+### 10.3 LN-style blindness
 
 Both RB and ML are blind to the source's LN *style*: `build_pool_universe` and the labeling pipeline both flatten a Long event to a `(start, token)` pair, discarding hold length. So the training data itself has no LN-style dimension, and the RB gate is a fixed 800 ms. A source-LN-signal infrastructure (preserve `(start, end)` hold ticks; derive per-package LN statistics; drive a dynamic gate) is the prerequisite for both a per-song RB gate and any future LN-aware model.
 
-### 9.4 Resume API v1 scope
+### 10.4 Resume API v1 scope
 
 v1 is RB-only and single-pass: ML resume, partial (region-local) conformance, and the centroid two-sided lookahead (E-γ) are all out of scope. The chord-composition divergence (§7.4) and the scratch-lane lookahead gap (§7.3) are known and tracked.
 
@@ -561,10 +667,14 @@ python run_pipeline.py --folder <package> [options]
 --intensity <1-20>           note aggressiveness (default 5)
 --scratch <1-20>             scratch frequency, source-aware mirror (default 5)
 --ln                         enable LN post-processing
---ml                         enable ML soft-ranking (non-recommended, §8)
+--ml                         enable ML soft-ranking (non-recommended, §9)
 --model-token / --model-lane TorchScript paths (required with --ml)
 --bms <filename>             explicit source chart select
 --seed <int|random>          placement seed (default 42)
+
+# Double-play synthesis (§8)
+--dp                         synthesize a double-play (14-key) chart
+--dp-split <timbre|balance|auto>  side-split strategy (default balance; auto→balance, DR-DP13)
 
 # Resume API (§5)
 --resume-state <path>        carry-over state JSON (resume mode)
@@ -595,8 +705,10 @@ python run_pipeline.py --folder <package> [options]
 
 Regression baseline: 6 of these (bumblebee / egosa / lepontinia / signal / tsuramic / wanwan) × {RB, ML} × {bms, json} at lv5 (§6.3).
 
+The DP extension (§8) is anchored on a separate survey of 1,852 human DP charts (§8.1) and validated by a 5-song DP smoke suite plus per-run `dp_pp_report` diagnostics rather than by this SP regression baseline.
+
 ---
 
-*This report describes BMS.Generator's note-placement pipeline as of 2026-05-25. The source code is the authoritative reference for exact behavior; this document is a narrative synthesis for readers.*
+*This report describes BMS.Generator's note-placement pipeline as of 2026-05-25, with a draft double-play synthesis addendum (§8). The source code is the authoritative reference for exact behavior; this document is a narrative synthesis for readers.*
 
 

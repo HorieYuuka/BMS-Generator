@@ -103,6 +103,40 @@ def compute_intensity_params(level: int) -> dict:
         # extreme intensity (lv5=2 typical [corpus side≤2=94%], lv10=3, lv15=4,
         # lv20=5). Combined (both-hand) cap = 2× this in _place_measure_dp.
         "DP_MAX_CHORD_SIZE_PER_SIDE":      round(_lerp(2,    3,    level, 5)),
+        # DR-DP12: DP combined per-measure density cap. Holds at 40
+        # for lv≤10 (low/mid unchanged), ramps to 57 by lv20 so co-onset chord
+        # promotion can thicken chords (a fixed 40 just re-drops them). Ceiling tuned
+        # 90→57 (promotion headroom 50→~17, ≈1/3) — 90 was too aggressive on dense
+        # chord songs (mightyA/addiction lv12). lv12≈43, lv15≈48, lv18≈54, lv20=57.
+        "DP_COMBINED_MEASURE_CAP":         round(_lerp(40,   40,   level, 57)),
+        # co-onset chord promotion (DR-DP12): only at high intensity (>10) so the
+        # validated low/mid sweep is byte-identical; thickens chords from same-onset
+        # residual (placement drops + band_quota layers).
+        "DP_CHORD_PROMOTE":                (level > 10),
+        # DR-DP12 elimination-form selection (A/C/D, addon §8.5):
+        #  A recurrence gate — only promote tokens occurring ≥ this (drop one-offs).
+        "DP_PROMOTE_MIN_OCC":              3,
+        #  C play-quality — skip a candidate whose centroid is within this (Hz) of a
+        #    note already in the chord (near-identical brightness = redundant press).
+        "DP_PROMOTE_CENTROID_EPS":         50.0,
+        #  D rhythm — off-beat onsets cap their chord at this fraction of the combined
+        #    cap; on-beat (idx%48==0) get the full cap. Ramps 0.4→1.0 over lv11–20 so
+        #    high intensity also fills weak beats.
+        "DP_PROMOTE_OFFBEAT_FACTOR":       round(_lerp(0.4, 0.4, level, 1.0), 3),
+        # ── intensity↔density alignment (DR-DP14, next-session goal 2026-06-16) ──
+        # DP is timing-invariant: felt-time NPS = Pos/s × avg_chord, and Pos/s is
+        # FIXED by the source (DP can't add timing positions). So the only density
+        # lever is chord_size. We align per-song toward a felt-time NPS target
+        # anchored to the HUMAN DP corpus (n=1852, BMS.Tools): target_chord =
+        # clamp(DP_TARGET_NPS / Pos_s, 1.0, DP_CHORD_CAP). Pos/s in the denominator
+        # makes the target adapt per song; the cap stops sparse-timing songs from
+        # being forced into artificial chord-walls (character preserved). Gated to
+        # level>10 so low/mid intensity stays byte-identical (like promotion).
+        #   DP_TARGET_NPS: lv10→15.1 (corpus p50/median) … lv20→24 (≈p95+).
+        #   DP_CHORD_CAP : corpus p90 all-position avg_chord (2.51) → 2.5.
+        "DP_TARGET_NPS":                   round(_lerp(15.0, 15.0, level, 24.0), 2),
+        "DP_CHORD_CAP":                    2.5,
+        "DP_DENSITY_ALIGN":                (level > 10),
     }
 
 
@@ -811,7 +845,11 @@ def _determine_scratch_seeds(pool_tokens, key_occ, scratch_occ, bgm_occ,
                               whitelist, ta_map, pct_map, fx_info):
     primary = sorted([t for t in pool_tokens if scratch_occ.get(t, 0) > 0],
                      key=lambda t: -scratch_occ.get(t, 0))
-    if primary: return primary, "primary"
+    # BMS_FORCE_FALLBACK_SCRATCH: test-only hook (DR-S1b fallback e2e fixture) —
+    # ignore the source's wheel tokens so a real, WAV-backed package exercises the
+    # fallback seed path. Never set in production.
+    if primary and not os.environ.get("BMS_FORCE_FALLBACK_SCRATCH"):
+        return primary, "primary"
     fallback = []
     for token in whitelist:
         info = ta_map.get(token)
@@ -840,7 +878,8 @@ CENTROID_EPSILON_RANDOM = 0.30  # probability of picking random lane instead of 
 TOKEN_LANE_AFFINITY_PROB   = 0.90
 TOKEN_LANE_AFFINITY_WINDOW = 32   # measures; affinity memory expires beyond this
 
-def _centroid_lane_select(token, avail, ta, prev_lane_idx, prev_centroid, rng, step_unit=300.0):
+def _centroid_lane_select(token, avail, ta, prev_lane_idx, prev_centroid, rng,
+                          step_unit=300.0, lane_weights=None):
     """Pick lane based on relative centroid change from previous note.
     Higher centroid → move right, lower → move left.
     step_unit: Hz per 1 lane step (auto-calibrated per song).
@@ -881,6 +920,15 @@ def _centroid_lane_select(token, avail, ta, prev_lane_idx, prev_centroid, rng, s
         avail_with_dist.append((dist, rng.random(), lane))
     avail_with_dist.sort()
     chosen = avail_with_dist[0][2]
+    # DP per-lane weight bias (DR-DP10): accept the closest lane with probability
+    # = its weight; on reject, fall to the next-closest. Realizes note-share ∝
+    # weight at placement. SP passes lane_weights=None → identical (no extra rng).
+    if lane_weights:
+        for _d, _r, cand in avail_with_dist:
+            w = lane_weights.get(LANE_INDEX[cand], 1.0)
+            if w >= 1.0 or rng.random() < w:
+                chosen = cand
+                break
     return chosen, LANE_INDEX[chosen] - 1, centroid
 
 
@@ -966,7 +1014,8 @@ def _place_measure_constrained(curr_cands, rng, hand_state, jack_state,
                                 scaled_tick=None,
                                 token_lane_memory=None,
                                 external_tkey_count=None,
-                                combined_chord_cap=None):
+                                combined_chord_cap=None,
+                                lane_weights=None):
     """
     external_tkey_count / combined_chord_cap: DP combined (both-hand)
         chord cap. When placing the second side, external_tkey_count maps
@@ -1147,7 +1196,8 @@ def _place_measure_constrained(curr_cands, rng, hand_state, jack_state,
                     _centroid_lane_select(token, avail, ta,
                                          centroid_state["prev_lane_idx"],
                                          centroid_state["prev_centroid"], rng,
-                                         step_unit=centroid_state["step_unit"])
+                                         step_unit=centroid_state["step_unit"],
+                                         lane_weights=lane_weights)
             else:
                 lane = fisher_yates_shuffle(avail, rng)[0]
         if ml_ctx is not None and ml_ctx["state"]["enable_lane"]:
@@ -1679,7 +1729,9 @@ DP_MIN_SIDE_SHARE = 0.25   # each hand gets ≥ this fraction of a block's note-
                             # (loosened from 0.40 so the spectral split dominates →
                             #  sharper bass/melodic separation; swap-on-repeat balances)
 DP_REPEAT_SIMILARITY = 0.55  # token-set Jaccard ≥ this → phase blocks are "the same phrase"
-DP_SCRATCH_KEY_GUARD_TICKS = 24  # scratch-hand keys within this of a scratch are gated (8th note)
+DP_SCRATCH_KEY_GUARD_TICKS = 16  # scratch-hand keys within this of a scratch are gated
+                                 # (~12th note; was 24/8th — tightened by user 2026-06-16).
+                                 # Same-tick muri/adjacent (0 ticks) still gated.
 # DP played-content rescue: the SP whitelist (band quota + fx-duration)
 # drops much of what the source actually PLAYED on key channels — invisible in SP
 # (→ BGM) but it strips the DP chart of its lead/bass (e.g. hardtek long-synth
@@ -1907,7 +1959,8 @@ def _place_measure_dp(curr_cands, cand_sides, rng, state_L, state_R,
             centroid_state=st["centroid"], bpm_lookup=bpm_lookup,
             jack_streak=st["jack_streak"], next_chord_lookahead=None,
             scaled_tick=scaled_tick, token_lane_memory=st["lane_mem"],
-            external_tkey_count=ext, combined_chord_cap=combined_cap)
+            external_tkey_count=ext, combined_chord_cap=combined_cap,
+            lane_weights=DP_PP_LANE_WEIGHTS["R" if remap else "L"])
         st["hand"] = hand_state
         out = [(i, t, P1_TO_P2_LANE[l] if remap else l) for (i, t, l) in placed]
         for k in diag_all:
@@ -1930,6 +1983,212 @@ def _place_measure_dp(curr_cands, cand_sides, rng, state_L, state_R,
         placed_all.extend(out)
         res_all.update(m_res)
     return placed_all, res_all, diag_all
+
+
+# ── Scratch position generation (DR-S1, 2026-06-17): source-INDEPENDENT placement ──
+# Corpus measurement (tools/_scratch_position_probe.py, 600 SP charts / 49.6k scratch
+# onsets): scratch POSITION is learnable even though scratch TOKEN audio is not
+# (DR-F7). Per-grid scratch-rate lift quarter 2.19× / 8th-off 0.84× / 16th 0.28× /
+# finer 0.38× (phase entropy 0.314 vs key 0.532; on_quarter rank-AUC 0.69 > the 0.6
+# audio ceiling; key-sparsity AUC 0.61). So we place scratches by rhythmic
+# convention — strong-beat-first, key-sparse-preferring — at a density set by the
+# intensity knob, NOT bound to source ch16 positions. Weights = measured per-class
+# rates normalized to quarter=1 (finer grid excluded — not a conventional slot).
+SCRATCH_POS_WEIGHT = {0: 1.00, 24: 0.38, 12: 0.13, 36: 0.13}  # phase%48 → weight
+SCRATCH_POS_KEYDENS_ALPHA = 0.15   # key-sparsity preference (higher = avoid dense)
+SCRATCH_POS_KEYDENS_WINDOW = 48    # ±1 beat window for local key density
+
+
+def _scratch_pos_weight(idx192):
+    """Conventional-slot weight for a within-measure position (0 = not a slot)."""
+    return SCRATCH_POS_WEIGHT.get(idx192 % 48, 0.0)
+
+
+def _scratch_gen_rate(scratch_level, dp=False):
+    """Source-independent target scratch density (scratches per active measure),
+    anchored to the human corpus (tools/_scratch_position_probe density pass).
+    SP: p50=0.69, p90=1.79. DP: p50=0.26, p90=1.03 (sparser — both hands key-busy).
+    lv5≈p50, lv20≈p90 (user 2026-06-17)."""
+    if dp:
+        return _lerp(0.26, 0.35, scratch_level, 1.03)
+    return _lerp(0.7, 0.9, scratch_level, 1.8)
+
+
+def _distribute_even(measures, total, per_measure_cap):
+    """Spread `total` units across `measures` (sorted) as evenly as possible
+    (Bresenham accumulator → deterministic), capped per measure. Returns
+    {measure: int}. Turns a chart-level scratch target into per-measure budgets."""
+    out = {}
+    if total <= 0 or not measures:
+        return out
+    n = len(measures)
+    acc = 0.0
+    rate = total / n
+    remaining = total
+    for m in measures:
+        acc += rate
+        take = int(acc)
+        acc -= take
+        take = min(take, per_measure_cap.get(m, take), remaining)
+        if take > 0:
+            out[m] = take
+            remaining -= take
+    return out
+
+
+def _scratch_eligible_tokens(pool_tokens, ta, pct_map, key_occ, scratch_occ,
+                             bgm_occ, intensity_origin):
+    """Tokens suitable to render on the wheel: 2a (the source's own wheel tokens,
+    scratch_occ>0) ∪ 2b (functional gate — short, loud-ish, recurring, key-origin
+    not background-FX). Used to pick which RESIDUAL onsets MAY be promoted to the
+    wheel (DR-S1). The promoted onset keeps its OWN token (no substitution); this
+    set just blocks moving a melodic-lead onset onto the wheel. (DR-F7: audio can't
+    gate scratch-ness, so this is a loose suitability filter, not a classifier.)"""
+    elig = {t for t in pool_tokens if scratch_occ.get(t, 0) > 0}
+    for t in pool_tokens:
+        if t in elig:
+            continue
+        info = ta.get(t) or {}
+        if not info.get("decode_ok"):
+            continue
+        if info.get("duration_ms", 1e9) > SCRATCH_FALLBACK_DURATION_MAX:
+            continue
+        if pct_map.get(t, 0.0) < SCRATCH_FALLBACK_MIN_ATTACK_PERCENTILE:
+            continue
+        if (key_occ.get(t, 0) + scratch_occ.get(t, 0) + bgm_occ.get(t, 0)
+                < SCRATCH_FALLBACK_MIN_OCCURRENCE):
+            continue
+        if intensity_origin.get(t, 0) != 1:
+            continue
+        elig.add(t)
+    return elig
+
+
+def dp_scratch_promote(placed_events, dp_residual, eligible_tokens, scratch_mode,
+                       scratch_scale, source_min_interval, params):
+    """DR-S1 (DP): MOVE scratch-eligible residual (BGM) onsets onto the wheel, by
+    rhythmic convention, to a DP-corpus-anchored density. The DP analog of the SP
+    tier-2 supplement (which DP lacked — DP scratch was source-mirror only, so
+    `--scratch`>5 was a no-op). NO invention — every promoted onset already exists
+    in dp_residual (BGM); moving residual→scratch and the anti-jump key→residual
+    are both MOVES, so the (measure,idx,token) multiset is preserved (same guarantee
+    as DR-DP12 chord promotion). Mutates placed_events + dp_residual; returns count.
+
+    Single scratch_hand per measure (DP convention): existing scratch measures keep
+    their hand, new ones alternate. After placing, the anti-jump gate demotes that
+    hand's keys within DP_SCRATCH_KEY_GUARD_TICKS to BGM (no muri/adjacent scratch).
+    Gated: primary needs scale>1 (≤5 = source mirror, byte-identical); fallback
+    generates at every level. Empty eligible → no-op."""
+    if not eligible_tokens:
+        return 0
+    if scratch_mode == "primary" and scratch_scale <= 1.0:
+        return 0
+    import bisect
+    keyL, keyR = defaultdict(int), defaultdict(int)
+    active, scr_tks = set(), set()
+    measure_hand = {}
+    scr_by_hand = {"L": [], "R": []}
+    for e in placed_events:
+        ln = e.get("lane", "")
+        m = e["measure"]
+        tk = m * 192 + e["idx192"]
+        if ln == "P1_SCR":
+            scr_tks.add(tk); active.add(m); measure_hand.setdefault(m, "L"); scr_by_hand["L"].append(tk)
+        elif ln == "P2_SCR":
+            scr_tks.add(tk); active.add(m); measure_hand.setdefault(m, "R"); scr_by_hand["R"].append(tk)
+        elif ln.startswith("P1_KEY"):
+            keyL[tk] += 1; active.add(m)
+        elif ln.startswith("P2_KEY"):
+            keyR[tk] += 1; active.add(m)
+    if not active:
+        return 0
+    rate = _scratch_gen_rate(scratch_scale * 5.0, dp=True)
+    supp = max(0, round(rate * len(active)) - len(scr_tks))
+    if supp <= 0:
+        return 0
+    cand_by_m = defaultdict(list)
+    for e in dp_residual:
+        if not isinstance(e, dict) or e.get("token") not in eligible_tokens:
+            continue
+        idx = e["idx192"]
+        if _scratch_pos_weight(idx) <= 0:
+            continue
+        tk = e["measure"] * 192 + idx
+        if tk in scr_tks:
+            continue
+        cand_by_m[e["measure"]].append((tk, e))
+    cap = int(params.get("SCRATCH_MAX_PER_MEASURE", SCRATCH_MAX_PER_MEASURE))
+    scr_per_m = defaultdict(int)
+    for tk in scr_tks:
+        scr_per_m[tk // 192] += 1
+    per_cap = {m: max(0, cap - scr_per_m.get(m, 0)) for m in active}
+    budget = _distribute_even(sorted(m for m in active if m in cand_by_m), supp, per_cap)
+    min_int = int(source_min_interval if source_min_interval is not None
+                  else params.get("SCRATCH_MIN_INTERVAL", SCRATCH_MIN_INTERVAL))
+    moved_ids, added = set(), []
+    chosen = {"L": sorted(scr_by_hand["L"]), "R": sorted(scr_by_hand["R"])}
+    new_parity = 0
+    for m in sorted(budget):
+        b = budget[m]
+        if b <= 0:
+            continue
+        hand = measure_hand.get(m)
+        if hand is None:
+            hand = "L" if new_parity % 2 == 0 else "R"
+            new_parity += 1
+        keys = keyL if hand == "L" else keyR
+        key_sorted = sorted(keys)
+        ranked = []
+        for (tk, e) in cand_by_m[m]:
+            w = _scratch_pos_weight(tk % 192)
+            lo = bisect.bisect_left(key_sorted, tk - SCRATCH_POS_KEYDENS_WINDOW)
+            hi = bisect.bisect_right(key_sorted, tk + SCRATCH_POS_KEYDENS_WINDOW)
+            kd = sum(keys[key_sorted[j]] for j in range(lo, hi))
+            ranked.append((w / (1.0 + SCRATCH_POS_KEYDENS_ALPHA * kd), tk, e))
+        ranked.sort(key=lambda x: (-x[0], x[1]))
+        picked = 0
+        for (_w, tk, e) in ranked:
+            if picked >= b:
+                break
+            ct = chosen[hand]
+            pos = bisect.bisect_left(ct, tk)
+            near = min((abs(ct[j] - tk) for j in (pos - 1, pos) if 0 <= j < len(ct)),
+                       default=10 ** 9)
+            if near < min_int:
+                continue
+            lane = "P1_SCR" if hand == "L" else "P2_SCR"
+            added.append({"token": e["token"], "lane": lane, "measure": m,
+                          "idx192": e["idx192"], "primitive": "Stream", "phase": "rest"})
+            moved_ids.add(id(e)); ct.insert(pos, tk); picked += 1
+    if not added:
+        return 0
+    # anti-jump gate: demote same-hand keys within the guard of any NEW scratch.
+    new_by_hand = {"L": sorted(a["measure"] * 192 + a["idx192"] for a in added if a["lane"] == "P1_SCR"),
+                   "R": sorted(a["measure"] * 192 + a["idx192"] for a in added if a["lane"] == "P2_SCR")}
+    demoted_ids = set()
+    for e in placed_events:
+        ln = e.get("lane", "")
+        hand = "L" if ln.startswith("P1_KEY") else "R" if ln.startswith("P2_KEY") else None
+        if hand is None:
+            continue
+        arr = new_by_hand[hand]
+        if not arr:
+            continue
+        tk = e["measure"] * 192 + e["idx192"]
+        pos = bisect.bisect_left(arr, tk)
+        near = min((abs(arr[j] - tk) for j in (pos - 1, pos) if 0 <= j < len(arr)),
+                   default=10 ** 9)
+        if near <= DP_SCRATCH_KEY_GUARD_TICKS:
+            demoted_ids.add(id(e))
+    demoted = [e for e in placed_events if id(e) in demoted_ids]
+    placed_events[:] = [e for e in placed_events if id(e) not in demoted_ids]
+    placed_events.extend(added)
+    dp_residual[:] = [e for e in dp_residual if id(e) not in moved_ids]
+    for e in demoted:
+        dp_residual.append({"token": e["token"], "measure": e["measure"],
+                            "idx192": e["idx192"], "reason": "dp_scratch_gate"})
+    return len(added)
+
 
 
 def _dp_scratch_measure(measure, placed, scratch_candidates, budget_m, min_int,
@@ -1990,6 +2249,726 @@ def _dp_scratch_measure(measure, placed, scratch_candidates, budget_m, min_int,
     return scr_placed, gated
 
 
+# ── DP pattern post-processing (addon §, 2026-06-14; jack-aware redesign) ─────
+# Timing-invariant lane refinement on the already-placed DP chart. Only `lane`
+# changes; (measure, idx192) is frozen (core §2 FORBIDDEN). DP-only — the SP path
+# never calls this (byte-identical preserved).
+#
+# JACK-AWARE (DR-DP9): the placement machine produces a jack-safe chart; this
+# layer must NOT introduce jacks. Each pattern reassignment is applied ATOMICALLY
+# against a shared per-side lane-usage timeline — a run only commits if every
+# member's target lane clears the jack floor (MIN_JACK_DELTA_TICKS); otherwise the
+# whole run reverts to its original (jack-safe) lanes. So a trill faster than the
+# jack floor "is no longer a trill" → falls back, and dense sections naturally
+# keep the original placement (the hand can't shape faster than it can play).
+# Cross-hand stair splitting is intentionally NOT done (impact data: no long
+# stairs in corpus; other-hand occupied at 0.5-0.66 of stair tkeys → high
+# intrusion). See addon DR-DP9.
+#
+# Three passes, single shared lane-state, one assignment authority (no inter-pass
+# conflict): chord shape/redistribute → stair → trill.
+DP_PP_STAIR_MIN_RUN = 3          # min consecutive single onsets to call a stair
+DP_PP_TRILL_MIN_RUN = 4          # min consecutive single onsets to call a trill
+DP_PP_RUN_MAX_GAP_TICKS = 14     # max idx192-tick gap between run members (~16th)
+DP_PP_TRILL_LANE_GAP = 2         # trill two-lane index gap (≥2 ⇒ non-adjacent)
+DP_PP_CENTROID_EPS = 1.0         # Hz tolerance for monotonic / alternation tests
+DP_PP_COMBINED_MEASURE_CAP = 40  # both-hand per-measure note ceiling; excess → BGM
+DP_PP_ZURE_TICKS = 4             # same-side notes within this window = "사실상 동시치기"
+                                 # (IIDX 즈레): forbidden-shape check groups them. 4 = 48th;
+                                 # < a 32nd (6t) so genuine fast runs aren't mis-grouped.
+# Rail-density bias: one hand covers all 7 keys in DP, so the ring/pinky (outer)
+# side is harder to press. When the density pass thins an over-dense measure it
+# drops from the harder side first, pushing that hand toward a 40:60 (hard:easy)
+# rail split (key 4 = neutral pivot). Right hand mirrors the left (outer = high).
+# Per-lane appearance weight: target note-share per lane ∝ weight (DR-DP10).
+# One hand covers all 7 keys in DP, so the ring finger (stretched to keys 2-3) is
+# weak — key 3 especially. Lower weight ⇒ fewer notes on that lane. Right hand
+# mirrors (lane k ↔ 8-k). The density pass equalizes notes-per-weight (drops from
+# the lane most over count/weight) and stair anchoring prefers high-weight lanes.
+DP_PP_LANE_WEIGHTS_L = {1: 1.0, 2: 0.9, 3: 0.95, 4: 1.0, 5: 0.9, 6: 1.0, 7: 1.0}
+DP_PP_LANE_WEIGHTS = {"L": DP_PP_LANE_WEIGHTS_L,
+                      "R": {k: DP_PP_LANE_WEIGHTS_L[8 - k] for k in range(1, 8)}}
+# Forbidden simultaneous-press shapes per hand (lane-index sets). A chord that
+# *contains* any of these is broken by spreading one note a rail (jack-aware).
+# Right hand is the physical mirror of the left (lane k ↔ 8-k): scratch is on the
+# outer edge of each side, so {2,3}/{5,6,7} on the left map to {6,5}/{3,2,1}.
+DP_PP_FORBIDDEN_SHAPES = {"L": ({2, 3}, {5, 6, 7}), "R": ({5, 6}, {1, 2, 3})}
+
+
+def _dp_lane_idx(lane):
+    """P1_KEY3 → 3 ; P2_KEY7 → 7 ; scratch / non-key → None."""
+    return int(lane[-1]) if ("KEY" in lane and lane[-1].isdigit()) else None
+
+
+def _dp_side(lane):
+    return "L" if lane.startswith("P1") else "R"
+
+
+def _dp_lane_name(side, idx):
+    return f"P{'1' if side == 'L' else '2'}_KEY{idx}"
+
+
+def _dp_cen(ta, token):
+    return float((ta.get(token) or {}).get("spectral_centroid_mean", 0.0) or 0.0)
+
+
+def _dp_attack(ta, token):
+    return float((ta.get(token) or {}).get("attack_rms", 0.0) or 0.0)
+
+
+def _dp_tk(e):
+    return e["measure"] * 192 + e["idx192"]
+
+
+def _dp_lane_weight(side, li):
+    return DP_PP_LANE_WEIGHTS[side].get(li, 1.0)
+
+
+def _dp_measure_seconds(bpm_events, base_bpm, measure_scale, measure_max):
+    """{measure: felt-seconds} via BPM-at-measure-start × #xxx02 scale.
+    192 ticks/measure = 4 beats, so seconds = 4·scale·60/bpm. The corpus DP
+    sources are clean (declared BPM == felt BPM, no BPM/scale trick), so these
+    segment seconds match BMS.Tools chart_seconds within rounding — good enough
+    as the denominator for the felt-time NPS target (DR-DP14)."""
+    sc = _normalize_measure_scale(measure_scale)
+    bev = sorted(bpm_events or [], key=lambda x: x[0])
+    out = {}
+    cur = base_bpm or 130.0
+    i = 0
+    for m in range(int(measure_max) + 1):
+        start = m * 192
+        while i < len(bev) and bev[i][0] <= start:
+            cur = bev[i][1]
+            i += 1
+        scale = sc.get(m, 1.0)
+        out[m] = (4.0 * scale / cur) * 60.0 if cur > 0 else 0.0
+    return out
+
+
+def _dp_pp_density(placed, residual, ta, cap, report):
+    """Drop the excess of over-dense measures to BGM, weighted per lane: each drop
+    takes the weakest-attack note on the lane most over-served relative to its
+    weight (max count/weight), pushing each hand toward note-share ∝ weight.
+    Timing-invariant (placed→BGM, so the placed∪residual multiset is preserved)."""
+    by_m = defaultdict(list)
+    for e in placed:
+        if _dp_lane_idx(e["lane"]) is not None:
+            by_m[e["measure"]].append(e)
+    drop = []
+    for evs in by_m.values():
+        if len(evs) <= cap:
+            continue
+        remaining = list(evs)
+        for _ in range(len(evs) - cap):
+            by_lane = defaultdict(list)
+            for e in remaining:
+                by_lane[(_dp_side(e["lane"]), _dp_lane_idx(e["lane"]))].append(e)
+            (_s, _l), pool = max(by_lane.items(),
+                                 key=lambda kv: len(kv[1]) / _dp_lane_weight(kv[0][0], kv[0][1]))
+            victim = min(pool, key=lambda e: _dp_attack(ta, e["token"]))
+            remaining.remove(victim); drop.append(victim)
+    drop_ids = {id(e) for e in drop}
+    if not drop_ids:
+        return
+    placed[:] = [e for e in placed if id(e) not in drop_ids]
+    for e in drop:
+        residual.append({"token": e["token"], "measure": e["measure"],
+                         "idx192": e["idx192"], "reason": "dp_density"})
+        report["density_dropped"] += 1
+
+
+def _dp_align_thin(placed, residual, ta, target_events, report):
+    """DR-DP14 density alignment, over-dense branch: demote notes to BGM GLOBALLY
+    to bring the chart's total played count down to `target_events` (the felt-time
+    NPS target × Pos count). Computed against the LIVE placed count at call time
+    (post promotion / rescue / density cap) so it self-corrects regardless of what
+    earlier passes added — the reverse of the promotion budget. Targets the chart
+    AVERAGE, not a per-measure peak cap (which would clip peaks below the average
+    and over-thin peaky songs). Only co-onset CHORD members are demotable (onsets
+    with ≥2 placed notes), so the single-note stream backbone is never thinned (a
+    fast/high-Pos/s song keeps its stream; only over-thick chords come down).
+    Weakest-attack first, on the lane most over-served by weight. Timing-invariant
+    (placed→BGM, so the placed∪residual multiset is preserved)."""
+    remaining = [e for e in placed if _dp_lane_idx(e["lane"]) is not None]
+    thin_n = len(remaining) - int(target_events)
+    if thin_n <= 0:
+        return
+    drop = []
+    for _ in range(thin_n):
+        by_tk = defaultdict(list)
+        for e in remaining:
+            by_tk[_dp_tk(e)].append(e)
+        pool_all = [e for e in remaining if len(by_tk[_dp_tk(e)]) >= 2]
+        if not pool_all:
+            break              # only single-note backbone left — preserve it
+        by_lane = defaultdict(list)
+        for e in pool_all:
+            by_lane[(_dp_side(e["lane"]), _dp_lane_idx(e["lane"]))].append(e)
+        (_s, _l), pool = max(by_lane.items(),
+                             key=lambda kv: len(kv[1]) / _dp_lane_weight(kv[0][0], kv[0][1]))
+        victim = min(pool, key=lambda e: _dp_attack(ta, e["token"]))
+        remaining.remove(victim); drop.append(victim)
+    drop_ids = {id(e) for e in drop}
+    if not drop_ids:
+        return
+    placed[:] = [e for e in placed if id(e) not in drop_ids]
+    for e in drop:
+        residual.append({"token": e["token"], "measure": e["measure"],
+                         "idx192": e["idx192"], "reason": "dp_align_thin"})
+        report["density_dropped"] += 1
+    report["dp_align_thinned"] = len(drop_ids)
+
+
+def _dp_singles(placed, side):
+    """Ordered [(tkey, event)] for tkeys where `side` holds exactly one key event."""
+    by_tk = defaultdict(list)
+    for e in placed:
+        if _dp_side(e["lane"]) != side or _dp_lane_idx(e["lane"]) is None:
+            continue
+        by_tk[_dp_tk(e)].append(e)
+    return [(tk, evs[0]) for tk, evs in sorted(by_tk.items()) if len(evs) == 1]
+
+
+def _dp_jack_count(key_events, jack_ticks):
+    """Same-lane consecutive onsets closer than the jack floor (per full lane,
+    which encodes side)."""
+    by = defaultdict(list)
+    for e in key_events:
+        by[e["lane"]].append(_dp_tk(e))
+    v = 0
+    for tks in by.values():
+        tks.sort()
+        v += sum(1 for a, b in zip(tks, tks[1:]) if b - a < jack_ticks)
+    return v
+
+
+def _dp_pp_chord(placed, residual, res_counts, ta, cap, jack_ticks, report):
+    """Shape each chord by centroid order (jack-neutral: same lane set per tkey),
+    then rescue chord_size_cap residuals onto a jack-safe free lane of the hand
+    that has room."""
+    occ = defaultdict(set)       # (tkey, side) → {lane_idx}
+    grp = defaultdict(list)      # (tkey, side) → [event]
+    for e in placed:
+        li = _dp_lane_idx(e["lane"])
+        if li is None:
+            continue
+        key = (_dp_tk(e), _dp_side(e["lane"]))
+        occ[key].add(li); grp[key].append(e)
+
+    def reshape(key):
+        side = key[1]; evs = grp[key]
+        lanes = sorted(_dp_lane_idx(e["lane"]) for e in evs)
+        for e, li in zip(sorted(evs, key=lambda e: _dp_cen(ta, e["token"])), lanes):
+            nl = _dp_lane_name(side, li)
+            if e["lane"] != nl:
+                e["lane"] = nl; report["chord_shaped"] += 1
+        occ[key] = set(lanes)
+
+    for key, evs in grp.items():
+        if len(evs) >= 2:
+            reshape(key)
+
+    def lane_jack_ok(side, li, t):
+        for e in placed:
+            if _dp_side(e["lane"]) == side and _dp_lane_idx(e["lane"]) == li \
+               and abs(_dp_tk(e) - t) < jack_ticks:
+                return False
+        return True
+
+    rescued = []
+    for r in residual:
+        if r.get("reason") != "chord_size_cap":
+            continue
+        tk = r["measure"] * 192 + r["idx192"]
+        for side in sorted(("L", "R"), key=lambda s: len(grp[(tk, s)])):
+            key = (tk, side)
+            if len(grp[key]) >= cap or any(e["token"] == r["token"] for e in grp[key]):
+                continue
+            free = [i for i in range(1, 8) if i not in occ[key] and lane_jack_ok(side, i, tk)]
+            if not free:
+                continue
+            ev = {"token": r["token"], "lane": _dp_lane_name(side, free[0]),
+                  "measure": r["measure"], "idx192": r["idx192"],
+                  "primitive": "Stream", "phase": r.get("phase", "")}
+            placed.append(ev); grp[key].append(ev); occ[key].add(free[0])
+            reshape(key)
+            rescued.append(r); report["chord_redistributed"] += 1
+            break
+    for r in rescued:
+        residual.remove(r)
+        if res_counts is not None and res_counts.get("chord_size_cap", 0) > 0:
+            res_counts["chord_size_cap"] -= 1
+    return len(rescued)
+
+
+def _dp_detect_stairs(singles, ta):
+    """Maximal monotonic-centroid runs (≥ DP_PP_STAIR_MIN_RUN). Returns
+    [(run, ascending)]."""
+    runs, i = [], 0
+    while i < len(singles):
+        def run_len(up):
+            run = [singles[i]]
+            for k in range(i + 1, len(singles)):
+                (tp, ep), (tc, ec) = singles[k - 1], singles[k]
+                if tc - tp > DP_PP_RUN_MAX_GAP_TICKS:
+                    break
+                d = _dp_cen(ta, ec["token"]) - _dp_cen(ta, ep["token"])
+                if (d > DP_PP_CENTROID_EPS) if up else (d < -DP_PP_CENTROID_EPS):
+                    run.append(singles[k])
+                else:
+                    break
+            return run
+        inc, dec = run_len(True), run_len(False)
+        run, asc = (inc, True) if len(inc) >= len(dec) else (dec, False)
+        if len(run) >= DP_PP_STAIR_MIN_RUN:
+            runs.append((run, asc)); i += len(run)
+        else:
+            i += 1
+    return runs
+
+
+def _dp_detect_trills(singles, ta):
+    """Maximal centroid-alternating runs (≥ DP_PP_TRILL_MIN_RUN)."""
+    runs, i = [], 0
+    while i < len(singles):
+        run, last = [singles[i]], None
+        for k in range(i + 1, len(singles)):
+            (tp, ep), (tc, ec) = singles[k - 1], singles[k]
+            if tc - tp > DP_PP_RUN_MAX_GAP_TICKS:
+                break
+            d = _dp_cen(ta, ec["token"]) - _dp_cen(ta, ep["token"])
+            if abs(d) <= DP_PP_CENTROID_EPS:
+                break
+            sgn = 1 if d > 0 else -1
+            if last is None or sgn == -last:
+                run.append(singles[k]); last = sgn
+            else:
+                break
+        if len(run) >= DP_PP_TRILL_MIN_RUN:
+            runs.append(run); i += len(run)
+        else:
+            i += 1
+    return runs
+
+
+def _dp_stair_candidates(n, asc, side):
+    """Lane-index candidate lists for a length-n staircase, ordered to prefer the
+    hand's EASY side (rail bias, DR-DP10): L easy = high lanes, R easy = low lanes.
+    The atomic apply takes the first jack-feasible one, so stairs land on the easy
+    side when possible — pulling load off the weak (outer) side."""
+    if n > 7:                                    # wrap (rare; corpus max = 7)
+        base = [1 + (k % 7) for k in range(n)] if asc else [7 - (k % 7) for k in range(n)]
+        return [base]
+    cands = ([list(range(s, s + n)) for s in range(1, 9 - n)] if asc
+             else [list(range(top, top - n, -1)) for top in range(n, 8)])
+    cands.sort(key=lambda c: -sum(_dp_lane_weight(side, x) for x in c))  # high-weight first
+    return cands
+
+
+def _dp_trill_candidates(run, ta):
+    """Two-lane (gapped) candidate lists; low-centroid cluster → lower lane."""
+    cens = [_dp_cen(ta, e["token"]) for _tk, e in run]
+    med = sorted(cens)[len(cens) // 2]
+    pairs = [(lo, lo + gap) for gap in range(DP_PP_TRILL_LANE_GAP, 7)
+             for lo in range(1, 8 - gap)]
+    pairs.sort(key=lambda p: (p[1] - p[0], abs((p[0] + p[1]) - 8)))  # tight, central first
+    return [[hi if c >= med else lo for c in cens] for lo, hi in pairs]
+
+
+def _dp_apply_run(run, candidates, side, lane_ticks, jack_ticks, report, kind):
+    """Atomically reassign a run to the first jack-feasible candidate lane-list;
+    if none clears the jack floor, revert to original lanes (fallback)."""
+    report[kind + "_detected"] += 1
+    ticks = [_dp_tk(e) for _tk, e in run]
+    origs = [_dp_lane_idx(e["lane"]) for _tk, e in run]
+    for li, t in zip(origs, ticks):           # lift this run off the timeline
+        lane_ticks[li].remove(t)
+    chosen = None
+    for cand in candidates:
+        tent = defaultdict(list); ok = True
+        for d, t in zip(cand, ticks):
+            if any(abs(t - x) < jack_ticks for x in lane_ticks[d]) \
+               or any(abs(t - x) < jack_ticks for x in tent[d]):
+                ok = False; break
+            tent[d].append(t)
+        if ok:
+            chosen = cand; break
+    if chosen is None:                         # fallback: restore originals
+        for li, t in zip(origs, ticks):
+            lane_ticks[li].append(t); lane_ticks[li].sort()
+        report[kind + "_fallback"] += 1
+        return 0
+    for (_tk, e), d in zip(run, chosen):
+        e["lane"] = _dp_lane_name(side, d)
+    for d, t in zip(chosen, ticks):
+        lane_ticks[d].append(t); lane_ticks[d].sort()
+    report[kind + "_applied"] += 1
+    return sum(1 for o, d in zip(origs, chosen) if o != d)
+
+
+def _dp_fix_forbidden(side, placed, residual, lane_ticks, jack_ticks, ta, report):
+    """Break forbidden simultaneous-press shapes (DP_PP_FORBIDDEN_SHAPES, mirrored
+    per hand, contains-match) — including 즈레 (near-simultaneous within
+    DP_PP_ZURE_TICKS, not just the exact same tick) — by spreading one note to a
+    jack-safe free lane (smallest rail shift first). If no move breaks every
+    forbidden shape while clearing the jack floor (a dense passage with no free
+    jack-safe lane — only reachable once a side holds ≥4 keys, i.e. high
+    intensity), demote the lowest-attack forbidden-member note to BGM so the hard
+    rule still holds (timing/content preserved: placed→residual). Returns # changed."""
+    forb = DP_PP_FORBIDDEN_SHAPES[side]
+    members_pool = set().union(*forb)
+    W = DP_PP_ZURE_TICKS
+    sev = sorted([e for e in placed if _dp_side(e["lane"]) == side
+                  and _dp_lane_idx(e["lane"]) is not None], key=_dp_tk)
+    n = len(sev)
+    changes = 0
+    demoted_ids = set()
+    for i in range(n):
+        if id(sev[i]) in demoted_ids:
+            continue
+        ti = _dp_tk(sev[i])
+        group = [sev[i]]
+        j = i + 1
+        while j < n and _dp_tk(sev[j]) - ti <= W:   # forward zure window
+            group.append(sev[j]); j += 1
+        group = [e for e in group if id(e) not in demoted_ids]
+        if len(group) < 2:
+            continue
+        laneset = {_dp_lane_idx(e["lane"]) for e in group}
+        if not any(f <= laneset for f in forb):
+            continue
+        report["chord_shape_detected"] += 1
+        cands = []
+        for e in group:
+            cur = _dp_lane_idx(e["lane"])
+            if cur not in members_pool:
+                continue
+            for tgt in range(1, 8):
+                if tgt not in laneset:                # free across the zure cluster
+                    cands.append((abs(tgt - cur), e, cur, tgt, _dp_tk(e)))
+        cands.sort(key=lambda x: x[0])
+        done = False
+        for _d, e, cur, tgt, te in cands:
+            newset = (laneset - {cur}) | {tgt}
+            if any(f <= newset for f in forb):
+                continue
+            if any(abs(te - x) < jack_ticks for x in lane_ticks[tgt]):
+                continue
+            lane_ticks[cur].remove(te)
+            lane_ticks[tgt].append(te); lane_ticks[tgt].sort()
+            e["lane"] = _dp_lane_name(side, tgt)
+            report["chord_shape_applied"] += 1; changes += 1; done = True
+            break
+        if done:
+            continue
+        # spread impossible → demote one member to BGM (lowest attack whose
+        # removal clears every forbidden shape in the group).
+        removable = [e for e in group
+                     if _dp_lane_idx(e["lane"]) in members_pool
+                     and not any(f <= (laneset - {_dp_lane_idx(e["lane"])}) for f in forb)]
+        if removable:
+            victim = min(removable, key=lambda e: _dp_attack(ta, e["token"]))
+            demoted_ids.add(id(victim))
+            lane_ticks[_dp_lane_idx(victim["lane"])].remove(_dp_tk(victim))
+            report["chord_shape_demoted"] = report.get("chord_shape_demoted", 0) + 1
+            changes += 1
+        else:
+            report["chord_shape_fallback"] += 1
+    if demoted_ids:
+        victims = [e for e in placed if id(e) in demoted_ids]
+        placed[:] = [e for e in placed if id(e) not in demoted_ids]
+        for e in victims:
+            residual.append({"token": e["token"], "measure": e["measure"],
+                             "idx192": e["idx192"], "reason": "dp_forbidden"})
+    return changes
+
+
+def _dp_pp_runs(placed, residual, ta, jack_ticks, report):
+    """Per side, one shared jack-safe lane timeline: stair runs, then trill runs,
+    then forbidden-shape spread LAST. Forbidden must run after the runs because
+    (a) stair/trill reassign the very singles a forbidden fix would touch — running
+    first lets them overwrite it — and (b) a monotonic stair *creates* {2,3}/{5,6,7}
+    adjacencies. It is iterated to a fixpoint to absorb move-induced cascades. Note:
+    stair-created adjacencies are 16th-spaced (≥ run gap), so the zure window
+    (DP_PP_ZURE_TICKS) leaves genuine runs alone and only resolves true near-chords."""
+    changes = 0
+    for side in ("L", "R"):
+        lane_ticks = defaultdict(list)
+        for e in placed:
+            if _dp_side(e["lane"]) == side and _dp_lane_idx(e["lane"]) is not None:
+                lane_ticks[_dp_lane_idx(e["lane"])].append(_dp_tk(e))
+        for v in lane_ticks.values():
+            v.sort()
+        singles = _dp_singles(placed, side)
+        skip = set()
+        for run, asc in _dp_detect_stairs(singles, ta):
+            for _tk, e in run:
+                skip.add(_dp_tk(e))
+            changes += _dp_apply_run(run, _dp_stair_candidates(len(run), asc, side),
+                                     side, lane_ticks, jack_ticks, report, "stair")
+        rem = [(tk, e) for (tk, e) in singles if tk not in skip]
+        for run in _dp_detect_trills(rem, ta):
+            changes += _dp_apply_run(run, _dp_trill_candidates(run, ta),
+                                     side, lane_ticks, jack_ticks, report, "trill")
+        for _ in range(4):                        # forbidden LAST; fixpoint vs cascade
+            if _dp_fix_forbidden(side, placed, residual, lane_ticks,
+                                 jack_ticks, ta, report) == 0:
+                break
+    return changes
+
+
+def _dp_pp_scratch_gate(placed, residual, report):
+    """Cross-measure anti-jump gate (DR-DP11): drop any key within
+    DP_SCRATCH_KEY_GUARD_TICKS (tkey-based, same hand) of a scratch onset to BGM.
+    The per-measure loop gate (`_dp_scratch_measure`) only sees within-measure
+    scratch idxs, so a scratch near a bar end + a key near the next bar's start
+    (인접/무리 scratch across the boundary — DR-DP3 hard gate) leaks. This global
+    pass closes that. Timing-invariant (placed→BGM)."""
+    import bisect
+    scr = {"L": [], "R": []}
+    for e in placed:
+        if e["lane"] in ("P1_SCR", "P2_SCR"):
+            scr[_dp_side(e["lane"])].append(_dp_tk(e))
+    scr["L"].sort(); scr["R"].sort()
+    if not scr["L"] and not scr["R"]:
+        return
+    keep, dropped = [], []
+    for e in placed:
+        if _dp_lane_idx(e["lane"]) is not None:
+            arr = scr[_dp_side(e["lane"])]
+            if arr:
+                t = _dp_tk(e)
+                pos = bisect.bisect_left(arr, t)
+                near = min((abs(t - arr[j]) for j in (pos - 1, pos)
+                            if 0 <= j < len(arr)), default=10 ** 9)
+                if near <= DP_SCRATCH_KEY_GUARD_TICKS:
+                    dropped.append(e); continue
+        keep.append(e)
+    if dropped:
+        placed[:] = keep
+        for e in dropped:
+            residual.append({"token": e["token"], "measure": e["measure"],
+                             "idx192": e["idx192"], "reason": "dp_scratch_gate"})
+            report["scratch_gated"] += 1
+
+
+def _dp_pp_report_init():
+    return {"timing_invariant": True, "jack_before": 0, "jack_after": 0,
+            "lane_changed": 0, "density_dropped": 0, "scratch_gated": 0,
+            "dp_align_thinned": 0,
+            "chord_shaped": 0, "chord_redistributed": 0,
+            "chord_shape_detected": 0, "chord_shape_applied": 0, "chord_shape_fallback": 0,
+            "chord_shape_demoted": 0,
+            "stair_detected": 0, "stair_applied": 0, "stair_fallback": 0,
+            "trill_detected": 0, "trill_applied": 0, "trill_fallback": 0,
+            "lane_dist_L": {}, "lane_dist_R": {},
+            "jack_by_measure_top": [], "measures_with_jack": 0}
+
+
+# co-onset chord promotion (DR-DP12). At high intensity, pull
+# residual tokens that share an onset with a placed key into free jack-safe chord
+# lanes so chords thicken. Runs on the ASSEMBLED residual (placement drops +
+# whitelist-excluded BGM objects), moving an event residual→placed BY OBJECT
+# IDENTITY — so the (measure,idx,token) multiset is preserved exactly (no
+# set-dedup, no invention, no onset move). Promotable reasons = placement drops +
+# band_quota (melodic rank-cut layers); FX pads, scratch-gate (muri), and unknown
+# are never promoted. Selection is ELIMINATION-FORM over the candidate pool at
+# each already-placed onset (placed notes are fixed, scope "a"):
+#   A — recurrence gate: drop one-off tokens (occ < DP_PROMOTE_MIN_OCC); a real
+#       recurring layer survives and, being scored deterministically, lands
+#       consistently across its repeats (no slot-luck flicker).
+#   C — play-quality: drop a candidate whose centroid is within
+#       DP_PROMOTE_CENTROID_EPS of a note already in the chord (near-identical
+#       brightness = a redundant second key-press, even if harmonically fine).
+#   D — rhythm: cap each onset's chord at the full combined cap on a beat
+#       (idx%48==0), at DP_PROMOTE_OFFBEAT_FACTOR of it off-beat (a soft,
+#       intensity-scaled limit so weak subdivisions stay lean).
+DP_PROMOTE_REASONS = {"no_lane_available", "hand_balance", "dp_density",
+                      "chord_size_cap", "measure_cap", "band_quota"}
+
+
+def _dp_chord_promote(placed, residual, ta, params, occ=None, max_promote=None):
+    per_side_cap = params.get("DP_MAX_CHORD_SIZE_PER_SIDE", 2)
+    combined_cap = 2 * per_side_cap
+    jack_ticks = int(params.get("MIN_JACK_DELTA_TICKS", 13) or 13)
+    min_occ = int(params.get("DP_PROMOTE_MIN_OCC", 3))
+    cen_eps = float(params.get("DP_PROMOTE_CENTROID_EPS", 50.0))
+    offbeat_factor = float(params.get("DP_PROMOTE_OFFBEAT_FACTOR", 0.5))
+    occ = occ or {}
+
+    lane_ticks = {"L": defaultdict(list), "R": defaultdict(list)}
+    placed_by_tk = defaultdict(lambda: {"L": set(), "R": set()})
+    placed_keys = set()
+    placed_cen_by_tk = defaultdict(list)
+    for e in placed:
+        placed_keys.add((e["measure"], e["idx192"], e["token"]))
+        li = _dp_lane_idx(e["lane"])
+        if li is not None:
+            s = _dp_side(e["lane"])
+            lane_ticks[s][li].append(_dp_tk(e))
+            placed_by_tk[_dp_tk(e)][s].add(li)
+            placed_cen_by_tk[_dp_tk(e)].append(_dp_cen(ta, e["token"]))
+    for s in lane_ticks:
+        for v in lane_ticks[s].values():
+            v.sort()
+
+    cand_by_tk = defaultdict(list)
+    for e in residual:
+        if e.get("reason") not in DP_PROMOTE_REASONS:
+            continue
+        if (e["measure"], e["idx192"], e["token"]) in placed_keys:
+            continue   # already a playable note at this onset (rescued/dup) — skip
+        if not (ta.get(e["token"]) or {}).get("decode_ok", True):
+            continue
+        if occ.get(e["token"], 0) < min_occ:        # A: drop one-off layers
+            continue
+        cand_by_tk[e["measure"] * 192 + e["idx192"]].append(e)
+
+    promoted_ids = set()
+    # DR-DP14: when a budget is given (density alignment), spend it on the most
+    # prominent candidates GLOBALLY — order onsets by their loudest/most-recurring
+    # candidate so the chart reaches its felt-time NPS target with the notes that
+    # matter most, then stop. max_promote=None → unbounded (legacy DR-DP12).
+    def _onset_priority(item):
+        # Codex DR-DP14 fix ③: order onsets by their most prominent candidate —
+        # recurrence first, then attack loudness (the [0] form dropped the attack
+        # tie-break, leaving equal-occ onsets in residual order). tk last = stable.
+        tk, cands = item
+        best = max((occ.get(e["token"], 0), _dp_attack(ta, e["token"])) for e in cands)
+        return (-best[0], -best[1], tk)
+    onsets = (sorted(cand_by_tk.items(), key=_onset_priority)
+              if max_promote is not None else list(cand_by_tk.items()))
+    for tk, cands in onsets:
+        if max_promote is not None and len(promoted_ids) >= max_promote:
+            break
+        if tk not in placed_by_tk:          # thicken existing onsets only (scope a)
+            continue
+        used = {"L": set(placed_by_tk[tk]["L"]), "R": set(placed_by_tk[tk]["R"])}
+        total = len(used["L"]) + len(used["R"])
+        kept_cens = list(placed_cen_by_tk[tk])
+        # D: per-onset final chord cap by beat strength.
+        on_beat = (tk % 48 == 0)
+        onset_cap = combined_cap if on_beat else max(total, round(combined_cap * offbeat_factor))
+        # A then prominence: recurring layers first, louder first within.
+        cands.sort(key=lambda e: (-occ.get(e["token"], 0), -_dp_attack(ta, e["token"])))
+        for e in cands:
+            if total >= onset_cap:
+                break
+            if max_promote is not None and len(promoted_ids) >= max_promote:
+                break
+            ek = (e["measure"], e["idx192"], e["token"])
+            if ek in placed_keys:           # guard a same-onset duplicate token
+                continue
+            ccen = _dp_cen(ta, e["token"])
+            if any(abs(ccen - kc) < cen_eps for kc in kept_cens):   # C: redundant brightness
+                continue
+            for s in sorted(("L", "R"), key=lambda s: len(used[s])):
+                if len(used[s]) >= per_side_cap:
+                    continue
+                forb = DP_PP_FORBIDDEN_SHAPES[s]
+                free = [(min((abs(li - u) for u in used[s]), default=7), li)
+                        for li in range(1, 8)
+                        if li not in used[s]
+                        and not any(abs(tk - x) < jack_ticks for x in lane_ticks[s][li])
+                        # forbidden-aware (DR-DP10): don't complete {2,3}/{5,6,7}
+                        # (L) or {5,6}/{1,2,3} (R) — promotion must not create the
+                        # very shapes the post-process tries (and may fail) to break.
+                        and not any(f <= (used[s] | {li}) for f in forb)]
+                if not free:
+                    continue
+                li = max(free)[1]           # max spread from existing chord lanes
+                e["lane"] = _dp_lane_name(s, li)   # mutate the residual event in place
+                e["primitive"] = e.get("primitive", "Stream")
+                e["phase"] = e.get("phase", "")
+                e.pop("reason", None)
+                used[s].add(li)
+                lane_ticks[s][li].append(tk); lane_ticks[s][li].sort()
+                placed_keys.add(ek); kept_cens.append(ccen)
+                total += 1
+                promoted_ids.add(id(e))
+                break
+    if promoted_ids:
+        promoted = [e for e in residual if id(e) in promoted_ids]
+        residual[:] = [e for e in residual if id(e) not in promoted_ids]
+        placed.extend(promoted)
+    return len(promoted_ids)
+
+
+def _dp_postprocess(placed_events, residual_events, res_counts, ta, params, diag):
+    """DP-only, timing-invariant, jack-aware lane refinement. Mutates
+    placed_events / residual_events in place; writes a result report into
+    diag["dp_pp_report"] (+ flat counters). Returns # rescued."""
+    report = _dp_pp_report_init()
+    diag["dp_pp_report"] = report
+    if os.environ.get("BMS_DP_PP_OFF") == "1":   # A/B listening toggle (debug)
+        return 0
+    jack_ticks = int(params.get("MIN_JACK_DELTA_TICKS", 13) or 13)
+    cap = params.get("DP_MAX_CHORD_SIZE_PER_SIDE", 2)
+
+    def multiset():
+        c = {}
+        for e in placed_events:
+            if e.get("type", "Tap") == "LN":
+                continue
+            k = (e["measure"], e["idx192"], e["token"]); c[k] = c.get(k, 0) + 1
+        for e in residual_events:
+            k = (e["measure"], e["idx192"], e["token"]); c[k] = c.get(k, 0) + 1
+        return c
+
+    def key_events():
+        return [e for e in placed_events if _dp_lane_idx(e["lane"]) is not None]
+
+    before = multiset()
+    report["jack_before"] = _dp_jack_count(key_events(), jack_ticks)
+
+    cap_m = int(params.get("DP_COMBINED_MEASURE_CAP", DP_PP_COMBINED_MEASURE_CAP) or DP_PP_COMBINED_MEASURE_CAP)
+    n_resc = _dp_pp_chord(placed_events, residual_events, res_counts, ta, cap,
+                          jack_ticks, report)
+    _dp_pp_scratch_gate(placed_events, residual_events, report)   # after chord (catch redistributed near-scratch keys)
+    _dp_pp_density(placed_events, residual_events, ta, cap_m, report)
+    # DR-DP14: density alignment final trim — thin the chart's AVERAGE played count
+    # down to the felt-time NPS target (chord members only; backbone preserved).
+    # Off → no-op (byte-identical). Computed against the LIVE count, so it also
+    # trims any small overshoot from _dp_pp_chord rescue above; the under-dense
+    # case (live ≤ target) is a no-op handled by the promotion budget (Codex ②:
+    # promote/thin are not strictly exclusive — thin self-corrects to target).
+    if params.get("_DP_ALIGN_ON") and params.get("_DP_ALIGN_TARGET_EVENTS") is not None:
+        _dp_align_thin(placed_events, residual_events, ta,
+                       int(params["_DP_ALIGN_TARGET_EVENTS"]), report)
+    run_changes = _dp_pp_runs(placed_events, residual_events, ta, jack_ticks, report)
+    report["lane_changed"] = run_changes + report["chord_shaped"] + report["chord_redistributed"]
+
+    report["jack_after"] = _dp_jack_count(key_events(), jack_ticks)
+    report["timing_invariant"] = (before == multiset())
+
+    for side in ("L", "R"):
+        dist = {k: 0 for k in range(1, 8)}
+        for e in key_events():
+            if _dp_side(e["lane"]) == side:
+                li = _dp_lane_idx(e["lane"])
+                if li:
+                    dist[li] += 1
+        report[f"lane_dist_{side}"] = dist
+
+    jm = {}
+    by = defaultdict(list)
+    for e in key_events():
+        by[e["lane"]].append((_dp_tk(e), e["measure"]))
+    for lst in by.values():
+        lst.sort()
+        for (t0, _m0), (t1, m1) in zip(lst, lst[1:]):
+            if t1 - t0 < jack_ticks:
+                jm[m1] = jm.get(m1, 0) + 1
+    report["measures_with_jack"] = len(jm)
+    report["jack_by_measure_top"] = sorted(jm.items(), key=lambda kv: -kv[1])[:5]
+
+    diag["dp_pp_chord_shaped"] = report["chord_shaped"]
+    diag["dp_pp_chord_redistributed"] = report["chord_redistributed"]
+    diag["dp_pp_stair_runs"] = report["stair_applied"]
+    diag["dp_pp_trill_runs"] = report["trill_applied"]
+    return n_resc
+
+
 def run_per_measure_loop(events, whitelist, pct_map, intensity_origin_map,
                          phase_blocks, measure_max, scratch_seeds, params=None,
                          ml_ctx=None, excluded=None, ta=None,
@@ -2005,7 +2984,7 @@ def run_per_measure_loop(events, whitelist, pct_map, intensity_origin_map,
                          end_measure=None,
                          next_chord_lookahead=None,
                          measure_scale=None,
-                         dp=False, dp_split="auto"):
+                         dp=False, dp_split="auto", dp_pool_events=None):
     """
     dp: when True, synthesize a DP (14-key + 2 scratch) chart from the SP pool
         via the DP template layer — per phase block SPLIT on the
@@ -2246,15 +3225,14 @@ def run_per_measure_loop(events, whitelist, pct_map, intensity_origin_map,
                     "lane_mem": {}}
         dp_state_L, dp_state_R = _new_dp_state(), _new_dp_state()
         dp_scr_state = {"scr_measures": 0}  # counts scratch measures → hand swap parity
-        # split-strategy router (addon §9): timbre (low_freq, STREAM songs) vs
-        # balance (split chords / alternate bursts, CHORD/PEAK songs). A naive
-        # candidate/source proxy can't tell jumpstream (stream-dominant, e.g.
-        # signal) from chord-dominant (e.g. wanwan) — both pack simultaneous
-        # notes; only the calibrated NoteAttributes chord/stream formula
-        # discriminates (tools/dp_source_character.py). So `auto` defaults to the
-        # validated-safe timbre split; pick `balance` explicitly for chord/peak
-        # songs (use dp_source_character.py to read the dominant attribute).
-        dp_split_mode = dp_split if dp_split in ("timbre", "balance") else "timbre"
+        # split-strategy router (addon §9, DR-DP13): `balance` is the default.
+        # Listening across the corpus (2026-06-16) found balance ≥ timbre
+        # everywhere — on chord/peak songs timbre piles a same-timbre burst onto
+        # one hand (bumblebee L-share 0.29, one hand 71%) while balance holds ~0.50;
+        # on stream songs (signal) they are indistinguishable. timbre's only edge
+        # (token→side affinity = melody stays on one hand) was inaudible, so it is
+        # demoted to an explicit opt-in. `auto` → balance; `timbre` still available.
+        dp_split_mode = dp_split if dp_split in ("timbre", "balance") else "balance"
 
     key_lane_idx_by_m = defaultdict(list)
     for ev in events:
@@ -2351,8 +3329,23 @@ def run_per_measure_loop(events, whitelist, pct_map, intensity_origin_map,
                     continue
                 _t2_seen.add((m, idx, tok))
                 tier2_by_m.setdefault(m, []).append((_t2_rank[tok], idx, tok))
+            # DR-S1 (2026-06-17): tier-2 already SELECTS pool onsets of scratch-
+            # eligible tokens and moves them to the wheel (multiset-safe — main()'s
+            # wl_residual build excludes scratch_placed_keys, so the onset moves from
+            # BGM→wheel, no invention). Its default ranking is token-rank then idx,
+            # which picks rhythmically-arbitrary positions. Under BMS_SCRATCH_POSGEN,
+            # rank candidates by the corpus-measured rhythmic convention FIRST
+            # (strong-beat: quarter≫8th-off≫16th; finer slots weight 0 → last), so
+            # the wheel lands on conventional beats. Pure re-ranking of the SAME
+            # candidate set — no new positions invented, density unchanged.
+            _scr_rhythm = (not dp) and os.environ.get(
+                "BMS_SCRATCH_POSGEN") not in (None, "0", "off")
             for m in tier2_by_m:
-                tier2_by_m[m].sort()
+                if _scr_rhythm:
+                    tier2_by_m[m].sort(key=lambda c: (-_scratch_pos_weight(c[1]),
+                                                      c[0], c[1]))
+                else:
+                    tier2_by_m[m].sort()
 
             # distribute the supplement over measures, weighted by candidate
             # availability, ceilinged per measure by min(level-lerped cap −
@@ -2401,6 +3394,7 @@ def run_per_measure_loop(events, whitelist, pct_map, intensity_origin_map,
                             _progressed = True
                     if not _progressed:
                         break  # every measure at headroom ceiling
+    scratch_posgen_inserted = 0
     scratch_tier2_inserted = 0
     prev_candidate_count = 0
     hand_state = ("balanced", 0); center_lane = "P1_KEY4"; jack_state = {}
@@ -2769,11 +3763,106 @@ def run_per_measure_loop(events, whitelist, pct_map, intensity_origin_map,
                 "mean_attack_rms": mean_rms,
             })
 
+    # ── timing-invariant pattern post-processing (chord/stair/trill) ──
+    dp_pp_diag = {"dp_pp_chord_shaped": 0, "dp_pp_chord_redistributed": 0,
+                  "dp_pp_stair_runs": 0, "dp_pp_trill_runs": 0, "dp_pp_report": {}}
+    dp_wl_residual_count = 0
+    dp_residual_assembled = False
+    if dp:
+        # ── intensity↔density alignment (DR-DP14) ──────────────────────────────
+        # Compute the per-song felt-time NPS target on the BASE placement (before
+        # promotion). Pos/s is source-fixed; target_chord = clamp(target_NPS/Pos_s,
+        # 1, chord_cap). The promotion budget (target_events − base_keys) bounds how
+        # many co-onset chords we add; the NPS cap (in _dp_postprocess) thins any
+        # over-dense base. Stashed into p as runtime _DP_ALIGN_* keys (single-caller
+        # functions, avoids signature churn). On by default at level>10; env
+        # BMS_DP_DENSITY_ALIGN=0 forces off for A/B listening.
+        # Default ON (2026-06-16, user-approved). Env BMS_DP_DENSITY_ALIGN=0/off
+        # forces it off (A/B compare); =1 forces the request on (still level-gated).
+        _align_env = os.environ.get("BMS_DP_DENSITY_ALIGN")
+        _align_req = (_align_env not in ("0", "off")) if _align_env is not None else True
+        # The level>10 gate (== DP_DENSITY_ALIGN) ALWAYS applies, even under the env
+        # override — so low/mid intensity stays byte-identical regardless of env.
+        _align_on = _align_req and bool(p.get("DP_DENSITY_ALIGN"))
+        p["_DP_ALIGN_ON"] = _align_on
+        _align_budget = None
+        if _align_on:
+            _kev = [e for e in placed_events if _dp_lane_idx(e["lane"]) is not None]
+            _pos = len({_dp_tk(e) for e in _kev})
+            # Codex DR-DP14 fix ①: the felt-time denominator must span only the
+            # PLAYABLE range (first→last placed-key measure), NOT pool measure_max —
+            # which includes BGM-only trailing measures that dilute Pos/s (the same
+            # reason run_density_rebalance avoids pool measure_max). Inflated dur →
+            # understated Pos/s → over-promote / under-thin.
+            _msec = _dp_measure_seconds(bpm_events, base_bpm, measure_scale, measure_max)
+            if _kev:
+                _m_lo = min(e["measure"] for e in _kev)
+                _m_hi = max(e["measure"] for e in _kev)
+                _dur = sum(_msec.get(m, 0.0) for m in range(_m_lo, _m_hi + 1)) or 1.0
+            else:
+                _dur = 1.0
+            _pos_s = _pos / _dur if _dur else 0.0
+            _tnps = float(p.get("DP_TARGET_NPS", 18.0))
+            _ccap = float(p.get("DP_CHORD_CAP", 2.5))
+            _tchord = min(max(_tnps / _pos_s, 1.0), _ccap) if _pos_s else 1.0
+            _tevents = round(_tchord * _pos)
+            _align_budget = max(0, _tevents - len(_kev))   # under-dense → promote
+            p["_DP_ALIGN_TARGET_EVENTS"] = _tevents          # over-dense → thin to here (live)
+            dp_pp_diag["dp_align"] = {
+                "pos": _pos, "dur": round(_dur, 2), "pos_s": round(_pos_s, 3),
+                "base_keys": len(_kev), "target_chord": round(_tchord, 3),
+                "target_events": _tevents, "promote_budget": _align_budget,
+            }
+        _promote = os.environ.get("BMS_DP_CHORD_PROMOTE")
+        if _promote is None:
+            _promote = p.get("DP_CHORD_PROMOTE")
+        _do_promote = bool(_promote) and _promote not in ("0", "off")
+        if _do_promote:
+            # Promotion path (DR-DP12, high intensity): assemble the FULL residual
+            # first (whitelist-excluded source tokens → BGM objects) so co-onset
+            # promotion can move events residual→placed BY OBJECT IDENTITY, preserving
+            # the (measure,idx,token) multiset exactly. Same dedup as the main() SP
+            # wl_residual build. Low/mid intensity skips this (no promotion) so its
+            # DP output stays byte-identical to the pre-DR-DP12 path (main rebuilds
+            # wl_residual there as before).
+            _scr_keys = all_scratch_placed_keys
+            _placed_keys = {(e["measure"], e["idx192"], e["token"]) for e in placed_events}
+            _wl_resid, _wl_seen = [], set()
+            for (_m, _i, _tok) in (dp_pool_events or []):
+                if excluded and _tok in excluded:
+                    _k = (_m, _i, _tok)
+                    if _k in _scr_keys or _k in _placed_keys or _k in _wl_seen:
+                        continue
+                    _wl_seen.add(_k)
+                    _wl_resid.append({"token": _tok, "measure": _m, "idx192": _i,
+                                      "reason": excluded[_tok]})
+            dp_wl_residual_count = len(_wl_resid)
+            dp_residual_assembled = True
+            residual_events[:] = _wl_resid + residual_events
+            # token total occurrence (key+scratch+bgm) feeds the recurrence gate (A).
+            _occ = {}
+            for _d in (key_occ or {}, scratch_occ or {}, bgm_occ or {}):
+                for _t, _c in _d.items():
+                    _occ[_t] = _occ.get(_t, 0) + _c
+            # BMS_DP_PROMOTE_DRYRUN: assemble residual but skip the move — for a
+            # content-preservation A/B on the SAME code path (promotion only moves
+            # objects, so dry-run vs live must have an identical multiset).
+            if not os.environ.get("BMS_DP_PROMOTE_DRYRUN"):
+                dp_pp_diag["dp_pp_chord_promoted"] = _dp_chord_promote(
+                    placed_events, residual_events, ta, p, occ=_occ,
+                    max_promote=_align_budget)
+        _dp_postprocess(placed_events, residual_events, res, ta, p, dp_pp_diag)
+        dp_placed_left = sum(1 for e in placed_events
+                             if e["lane"].startswith("P1") and "KEY" in e["lane"])
+        dp_placed_right = sum(1 for e in placed_events
+                              if e["lane"].startswith("P2") and "KEY" in e["lane"])
+
     result = {
         "chb_count": chb_count, "stream_count": stream_count,
         "downgrade_count": downgrade_count,
         "total_placed": total_placed, "scratch_inserted": total_scratch,
         "scratch_tier2_inserted": scratch_tier2_inserted,
+        "scratch_posgen_inserted": scratch_posgen_inserted,
         "scratch_supplement_by_measure": scratch_supplement_by_m,
         "residual_counts": dict(res),
         "placed_events": placed_events, "residual_events": residual_events,
@@ -2798,6 +3887,9 @@ def run_per_measure_loop(events, whitelist, pct_map, intensity_origin_map,
         "dp_blocks_swapped": dp_blocks_swapped,
         "dp_rescued": dp_rescued if dp else 0,
         "dp_measure_rebalanced": dp_measure_rebalanced,
+        "dp_wl_residual_count": dp_wl_residual_count,
+        "dp_residual_assembled": dp_residual_assembled,
+        **dp_pp_diag,
         "dp_split_mode": dp_split_mode,
     }
     # v12 §23.5: resume mode emits partial result with end_state for cascading.
@@ -3509,7 +4601,7 @@ def main(intensity_level=5, scratch_level=5, enable_ln=False,
             end_measure=end_measure,
             next_chord_lookahead=next_chord_lookahead,
             measure_scale=measure_scale,
-            dp=dp, dp_split=dp_split)
+            dp=dp, dp_split=dp_split, dp_pool_events=pool_events)
         # v12 §23.5: resume mode short-circuits with partial schema, no
         # post-processing — caller (BMS.Compare) splices and invokes finalize.
         if resume_state is not None:
@@ -3539,23 +4631,54 @@ def main(intensity_level=5, scratch_level=5, enable_ln=False,
         if dp:
             _l, _r = result["dp_placed_left"], result["dp_placed_right"]
             _sl, _sr = result["dp_scratch_left"], result["dp_scratch_right"]
-            # audio preservation (timing invariant): whitelist-excluded source
-            # tokens must still play as BGM (#01), exactly as the SP path builds
-            # wl_residuals. Without this they're neither placed nor residual →
-            # silent, breaking the source's content (DP early-return omitted it).
-            _scr_keys = result.get("scratch_placed_keys", set())
-            _placed_keys = {(e["measure"], e["idx192"], e["token"])
-                            for e in result["placed_events"]}
-            _wl_resid, _wl_seen = [], set()
-            for (_m, _i, _tok) in pool_events:
-                if _tok in excluded:
-                    _k = (_m, _i, _tok)
-                    if _k in _scr_keys or _k in _placed_keys or _k in _wl_seen:
-                        continue
-                    _wl_seen.add(_k)
-                    _wl_resid.append({"token": _tok, "measure": _m, "idx192": _i,
-                                      "reason": excluded[_tok]})
-            dp_residual = _wl_resid + result["residual_events"]
+            # audio preservation (timing invariant): whitelist-excluded source tokens
+            # must still play as BGM (#01). When promotion ran (DR-DP12, high
+            # intensity) the loop already assembled wl_residual into
+            # result["residual_events"] (so promotion moved events by identity); for
+            # the low/mid path it was not, so rebuild it here exactly as before.
+            if result.get("dp_residual_assembled"):
+                dp_residual = result["residual_events"]
+                _wl_resid = [None] * result.get("dp_wl_residual_count", 0)  # count only
+            else:
+                _scr_keys = result.get("scratch_placed_keys", set())
+                _placed_keys = {(e["measure"], e["idx192"], e["token"])
+                                for e in result["placed_events"]}
+                _wl_resid, _wl_seen = [], set()
+                for (_m, _i, _tok) in pool_events:
+                    if _tok in excluded:
+                        _k = (_m, _i, _tok)
+                        if _k in _scr_keys or _k in _placed_keys or _k in _wl_seen:
+                            continue
+                        _wl_seen.add(_k)
+                        _wl_resid.append({"token": _tok, "measure": _m, "idx192": _i,
+                                          "reason": excluded[_tok]})
+                dp_residual = _wl_resid + result["residual_events"]
+            # DR-S1 (DP): source-independent scratch promotion (move residual→wheel
+            # by rhythmic convention, DP-corpus density). Multiset-safe (moves only)
+            # so the DP (m,idx,token) invariant holds. Gating (Codex DEFAULT-WITH-
+            # FIXES, 2026-06-17): DP primary-supplement is **default ON** (it fixes
+            # the `--scratch`>5 no-op; ≤5 still byte-identical via the scale>1 gate
+            # inside dp_scratch_promote). fallback stays **opt-in** until it has
+            # end-to-end coverage (no fallback song in the corpus). env=0 forces off.
+            _scr_env = os.environ.get("BMS_SCRATCH_POSGEN")
+            if _scr_env in ("0", "off"):
+                _run_dp_scr = False
+            elif _scr_env is not None:
+                _run_dp_scr = True                       # explicit on: incl. fallback
+            else:
+                _run_dp_scr = (scratch_mode == "primary")  # default: primary only
+            _dp_scr_added = 0
+            if _run_dp_scr:
+                _elig = _scratch_eligible_tokens(
+                    pool_tokens, ta, pct_map, key_occ, scratch_occ, bgm_occ,
+                    intensity_origin)
+                _dp_scr_added = dp_scratch_promote(
+                    result["placed_events"], dp_residual, _elig,
+                    scratch_mode, scratch_scale, source_scratch_min_interval,
+                    effective_params)
+                if _dp_scr_added:   # observability: recount scratch after promotion
+                    _sl = sum(1 for e in result["placed_events"] if e["lane"] == "P1_SCR")
+                    _sr = sum(1 for e in result["placed_events"] if e["lane"] == "P2_SCR")
             dp_output = {
                 "placed": result["placed_events"],
                 "residual": dp_residual,
@@ -3572,7 +4695,14 @@ def main(intensity_level=5, scratch_level=5, enable_ln=False,
                     "dp_blocks_swapped": result["dp_blocks_swapped"],
                     "dp_rescued": result["dp_rescued"],
                     "dp_measure_rebalanced": result["dp_measure_rebalanced"],
+                    "dp_pp_chord_shaped": result["dp_pp_chord_shaped"],
+                    "dp_pp_chord_redistributed": result["dp_pp_chord_redistributed"],
+                    "dp_pp_stair_runs": result["dp_pp_stair_runs"],
+                    "dp_pp_trill_runs": result["dp_pp_trill_runs"],
+                    "dp_pp_report": result.get("dp_pp_report", {}),
                     "dp_split_mode": result["dp_split_mode"],
+                    "dp_chord_promoted": result.get("dp_pp_chord_promoted", 0),
+                    "dp_scratch_promoted": _dp_scr_added,
                     "total_placed": result["total_placed"],
                     "residual_total": len(dp_residual),
                     "wl_residual_count": len(_wl_resid),
@@ -3593,6 +4723,20 @@ def main(intensity_level=5, scratch_level=5, enable_ln=False,
                   f"scr L={_sl}/R={_sr} over {result['dp_scratch_measures']} scr-measures "
                   f"gated={result['dp_scratch_gated']}), "
                   f"{len(dp_residual)} residual ({len(_wl_resid)} wl→BGM)")
+            _pp = result.get("dp_pp_report", {})
+            if _pp:
+                _dL, _dR = _pp.get("lane_dist_L", {}), _pp.get("lane_dist_R", {})
+                _shL = round((_dL.get(2, 0) + _dL.get(3, 0)) / max(1, sum(_dL.values())), 3)
+                _shR = round((_dR.get(5, 0) + _dR.get(6, 0)) / max(1, sum(_dR.values())), 3)
+                print(f"  PP report: invariant={'PASS' if _pp['timing_invariant'] else 'FAIL'} "
+                      f"jack {_pp['jack_before']}→{_pp['jack_after']} | "
+                      f"density_dropped={_pp['density_dropped']} scratch_gated={_pp['scratch_gated']} | "
+                      f"stair {_pp['stair_applied']}/{_pp['stair_detected']} (fb {_pp['stair_fallback']}) | "
+                      f"trill {_pp['trill_applied']}/{_pp['trill_detected']} (fb {_pp['trill_fallback']}) | "
+                      f"chord shaped={_pp['chord_shaped']} redist={_pp['chord_redistributed']} "
+                      f"shape_fix={_pp['chord_shape_applied']}/{_pp['chord_shape_detected']} (fb {_pp['chord_shape_fallback']}) | "
+                      f"weighted-lane share L(2,3)={_shL} R(5,6)={_shR} | "
+                      f"lanes changed={_pp['lane_changed']}")
             return
     else:
         # ── v12 §23.6 finalize mode: skip placement loop, run post-processing
@@ -3865,9 +5009,10 @@ if __name__ == "__main__":
                     help="DP synthesis: produce a 14-key+2-scratch chart "
                          "from the SP pool via side-local placement. RB-only, full-chart.")
     ap.add_argument("--dp-split", default="auto", choices=["auto", "timbre", "balance"],
-                    help="DP hand-split strategy: timbre (low_freq, stream songs), "
-                         "balance (split chords / alternate bursts, chord/peak songs), "
-                         "or auto (route by local chord/burst proxies). Default auto.")
+                    help="DP hand-split strategy: balance (load-balanced, the "
+                         "default — split chords / alternate bursts), or timbre "
+                         "(low_freq bass↔melody split, opt-in for stream songs). "
+                         "auto → balance (DR-DP13).")
     args = ap.parse_args()
     if args.dp and (args.resume_state or args.finalize or args.ml):
         ap.error("--dp cannot be combined with --resume-state/--finalize/--ml (addon §5)")
